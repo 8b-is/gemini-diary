@@ -141,6 +141,9 @@ def _have(cmd: str) -> bool:
 
 def check_ports() -> None:
     """Who owns the ports the constellation shares. Three services want 8788."""
+    if not WA.exists():
+        _skip_section("ports", "wa-stream not on this host", ["port ownership"])
+        return
     if not _have("lsof"):
         _skip_section("ports", "lsof not installed here", ["port ownership"])
         return
