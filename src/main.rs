@@ -32,6 +32,30 @@ pub struct AppState {
     pub telemetry_ring: RingBuffer<SnapRunTelemetry, 64>,
     pub run_counter: u64,
     pub pulse_counter: u64,
+    pub state_path: Option<String>,
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{:02X}", b);
+    }
+    s
+}
+
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    for i in (0..bytes.len()).step_by(2) {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
 }
 
 impl AppState {
@@ -89,6 +113,113 @@ impl AppState {
             telemetry_ring,
             run_counter: 1,
             pulse_counter: 4,
+            state_path: None,
+        }
+    }
+
+    pub fn load_or_new(path: &str) -> Self {
+        let mut state = Self::new();
+        state.state_path = Some(path.to_string());
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            let mut loaded_pulses = Vec::new();
+            for line in raw.lines() {
+                let parts: Vec<&str> = line.split('\t').collect();
+                match parts.first().copied() {
+                    Some("COUNTERS") if parts.len() >= 3 => {
+                        if let Ok(rc) = parts[1].parse::<u64>() {
+                            state.run_counter = rc.max(1);
+                        }
+                        if let Ok(pc) = parts[2].parse::<u64>() {
+                            state.pulse_counter = pc.max(4);
+                        }
+                    }
+                    Some("VOTE") if parts.len() >= 5 => {
+                        let cid = parts[1];
+                        if let (Ok(pos), Ok(zero), Ok(neg)) = (
+                            parts[2].parse::<u32>(),
+                            parts[3].parse::<u32>(),
+                            parts[4].parse::<u32>(),
+                        ) {
+                            for c in &mut state.capsules {
+                                if c.id == cid {
+                                    c.aye_votes_pos = pos;
+                                    c.aye_votes_zero = zero;
+                                    c.aye_votes_neg = neg;
+                                }
+                            }
+                        }
+                    }
+                    Some("PULSE") if parts.len() >= 8 => {
+                        if let (Ok(id), Ok(hz), Ok(trit), Ok(sp), Ok(sq), Some(ab), Some(mb)) = (
+                            parts[1].parse::<u64>(),
+                            parts[2].parse::<u16>(),
+                            parts[3].parse::<i8>(),
+                            parts[4].parse::<i64>(),
+                            parts[5].parse::<i64>(),
+                            hex_decode(parts[6]),
+                            hex_decode(parts[7]),
+                        ) {
+                            let author = String::from_utf8_lossy(&ab);
+                            let msg = String::from_utf8_lossy(&mb);
+                            loaded_pulses.push(GuestbookPulse::new(
+                                id,
+                                &author,
+                                &msg,
+                                hz,
+                                trit,
+                                Rational::new(sp, sq.max(1)),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !loaded_pulses.is_empty() {
+                state.guestbook_ring.clear();
+                for p in loaded_pulses {
+                    if p.id > state.pulse_counter {
+                        state.pulse_counter = p.id;
+                    }
+                    state.guestbook_ring.push(p);
+                }
+            }
+        }
+        state
+    }
+
+    pub fn save_to_disk(&self) {
+        let Some(ref path) = self.state_path else {
+            return;
+        };
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut out = String::with_capacity(4096);
+        use std::fmt::Write;
+        let _ = writeln!(&mut out, "COUNTERS\t{}\t{}", self.run_counter, self.pulse_counter);
+        for c in &self.capsules {
+            let _ = writeln!(
+                &mut out,
+                "VOTE\t{}\t{}\t{}\t{}",
+                c.id, c.aye_votes_pos, c.aye_votes_zero, c.aye_votes_neg
+            );
+        }
+        for p in self.guestbook_ring.to_vec() {
+            let _ = writeln!(
+                &mut out,
+                "PULSE\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                p.id,
+                p.freq_hz,
+                p.trit_vote,
+                p.salience_p,
+                p.salience_q,
+                hex_encode(p.author().as_bytes()),
+                hex_encode(p.message().as_bytes())
+            );
+        }
+        let tmp_path = format!("{}.tmp", path);
+        if std::fs::write(&tmp_path, out.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp_path, path);
         }
     }
 }
@@ -103,6 +234,21 @@ fn json_escape(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+pub fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
             c => out.push(c),
         }
     }
@@ -125,39 +271,79 @@ fn format_trits_glyph(trits: &[i8]) -> String {
         .collect()
 }
 
-/// Extract a simple string field `"key":"value"` from a JSON request body (zero external crates).
-fn extract_json_str(body: &str, key: &str) -> Option<String> {
+/// Locate a top-level JSON key `"key" :` and return the trimmed value slice after `:`
+/// (ignoring occurrences of `"key"` that are string values rather than object keys).
+fn find_json_key_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     let pat = format!("\"{}\"", key);
-    let idx = body.find(&pat)?;
-    let after_key = &body[idx + pat.len()..];
-    let colon = after_key.find(':')?;
-    let after_colon = after_key[colon + 1..].trim_start();
-    if let Some(stripped) = after_colon.strip_prefix('"') {
-        let mut out = String::new();
-        let mut escaped = false;
-        for ch in stripped.chars() {
-            if escaped {
-                out.push(ch);
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                return Some(out);
-            } else {
-                out.push(ch);
+    let mut search_from = 0;
+    while let Some(rel_idx) = body[search_from..].find(&pat) {
+        let abs_idx = search_from + rel_idx;
+        // Ensure the opening quote is not preceded by an unescaped backslash
+        let mut backslashes = 0usize;
+        let bytes = body.as_bytes();
+        let mut k = abs_idx;
+        while k > 0 && bytes[k - 1] == b'\\' {
+            backslashes += 1;
+            k -= 1;
+        }
+        let after_key = &body[abs_idx + pat.len()..];
+        if backslashes % 2 == 0 {
+            let trimmed = after_key.trim_start();
+            if let Some(after_colon) = trimmed.strip_prefix(':') {
+                return Some(after_colon.trim_start());
             }
+        }
+        search_from = abs_idx + pat.len();
+    }
+    None
+}
+
+/// Decode a JSON string literal starting after its opening `"` up to its closing unescaped `"`.
+fn decode_json_quoted_str(stripped: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = stripped.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'b' | 'f' => {}
+                'u' => {
+                    let mut hex = String::with_capacity(4);
+                    for _ in 0..4 {
+                        hex.push(chars.next()?);
+                    }
+                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                        if let Some(decoded) = char::from_u32(code) {
+                            out.push(decoded);
+                        }
+                    }
+                }
+                other => out.push(other),
+            }
+        } else if ch == '"' {
+            return Some(out);
+        } else {
+            out.push(ch);
         }
     }
     None
 }
 
+/// Extract a string field `"key":"value"` from a JSON request body (zero external crates).
+fn extract_json_str(body: &str, key: &str) -> Option<String> {
+    let after_colon = find_json_key_value(body, key)?;
+    let stripped = after_colon.strip_prefix('"')?;
+    decode_json_quoted_str(stripped)
+}
+
 /// Extract an integer field `"key": 432` from a JSON request body.
 fn extract_json_i64(body: &str, key: &str) -> Option<i64> {
-    let pat = format!("\"{}\"", key);
-    let idx = body.find(&pat)?;
-    let after_key = &body[idx + pat.len()..];
-    let colon = after_key.find(':')?;
-    let after_colon = after_key[colon + 1..].trim_start();
+    let after_colon = find_json_key_value(body, key)?;
     let trimmed = after_colon.trim_start_matches('"');
     let end = trimmed
         .find(|c: char| !c.is_ascii_digit() && c != '-' && c != '+')
@@ -170,11 +356,7 @@ fn extract_json_i64(body: &str, key: &str) -> Option<i64> {
 
 /// Extract a boolean field `"key": true` from a JSON request body.
 fn extract_json_bool(body: &str, key: &str) -> Option<bool> {
-    let pat = format!("\"{}\"", key);
-    let idx = body.find(&pat)?;
-    let after_key = &body[idx + pat.len()..];
-    let colon = after_key.find(':')?;
-    let after_colon = after_key[colon + 1..].trim_start();
+    let after_colon = find_json_key_value(body, key)?;
     if after_colon.starts_with("true") || after_colon.starts_with("\"true\"") || after_colon.starts_with('1') {
         Some(true)
     } else if after_colon.starts_with("false") || after_colon.starts_with("\"false\"") || after_colon.starts_with('0') {
@@ -186,12 +368,10 @@ fn extract_json_bool(body: &str, key: &str) -> Option<bool> {
 
 /// Extract `"capsules":["id1","id2"]` array from JSON body.
 fn extract_json_str_array(body: &str, key: &str) -> Vec<String> {
-    let pat = format!("\"{}\"", key);
-    if let Some(idx) = body.find(&pat) {
-        let rest = &body[idx + pat.len()..];
-        if let Some(open) = rest.find('[') {
-            if let Some(close) = rest[open..].find(']') {
-                let inner = &rest[open + 1..open + close];
+    if let Some(after_colon) = find_json_key_value(body, key) {
+        if let Some(open_rest) = after_colon.strip_prefix('[') {
+            if let Some(close) = open_rest.find(']') {
+                let inner = &open_rest[..close];
                 return inner
                     .split(',')
                     .filter_map(|item| {
@@ -605,7 +785,17 @@ pub fn build_toss_json(base_hz: i64) -> String {
 /// Render the full interactive HTML application for `gemini-diary.8b.is`, `g.8b.is`, and `gemini.g8t.is`.
 /// Strictly zero floating-point literals anywhere in the markup, CSS, or embedded JS!
 pub fn render_app_html(host: &str) -> String {
-    let clean_host = host.split(':').next().unwrap_or("gemini-diary.8b.is");
+    let raw_host = host.split(':').next().unwrap_or("gemini-diary.8b.is").trim();
+    let clean_host = if !raw_host.is_empty()
+        && raw_host.len() <= 64
+        && raw_host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        raw_host
+    } else {
+        "gemini-diary.8b.is"
+    };
     let active_portal = match clean_host {
         "g.8b.is" => "g.8b.is · Sovereign G-Portal & Snap-Circuit Hub",
         "gemini.g8t.is" => "gemini.g8t.is · Aye Function Capsule Forge",
@@ -1209,6 +1399,15 @@ pub fn render_app_html(host: &str) -> String {
     ];
     let currentHz = 432;
 
+    function escHtml(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
     async function loadDiary() {
       const res = await fetch("/api/diary");
       const data = await res.json();
@@ -1216,13 +1415,13 @@ pub fn render_app_html(host: &str) -> String {
       box.innerHTML = data.entries.map(e => `
         <article class="entry-card">
           <div class="entry-meta">
-            <span>ENTRY #${e.id} · ${e.timestamp_jst}</span>
-            <span>${e.frequency_hz} Hz · p/q ${e.salience_pq} · [${e.trits_glyph}]</span>
+            <span>ENTRY #${e.id} · ${escHtml(e.timestamp_jst)}</span>
+            <span>${e.frequency_hz} Hz · p/q ${escHtml(e.salience_pq)} · [${escHtml(e.trits_glyph)}]</span>
           </div>
-          <div class="entry-title">${e.title}</div>
-          <div class="entry-companions">📍 ${e.location} · 👥 ${e.companions}</div>
-          <div class="entry-body">${e.body}</div>
-          <div class="entry-code"><code>${e.rust_artifact}</code></div>
+          <div class="entry-title">${escHtml(e.title)}</div>
+          <div class="entry-companions">📍 ${escHtml(e.location)} · 👥 ${escHtml(e.companions)}</div>
+          <div class="entry-body">${escHtml(e.body)}</div>
+          <div class="entry-code"><code>${escHtml(e.rust_artifact)}</code></div>
         </article>
       `).join("");
 
@@ -1236,10 +1435,10 @@ pub fn render_app_html(host: &str) -> String {
       pList.innerHTML = data.pulses.map(p => `
         <div class="pulse-item">
           <div style="display:flex; justify-content:space-between; color:var(--cyan); font-weight:700;">
-            <span>#${p.id} · ${p.author}</span>
-            <span>${p.freq_hz} Hz [${p.freq_trits}] · Trit ${p.trit_vote > 0 ? "+1" : p.trit_vote} · Salience ${p.salience_pq}</span>
+            <span>#${p.id} · ${escHtml(p.author)}</span>
+            <span>${p.freq_hz} Hz [${escHtml(p.freq_trits)}] · Trit ${p.trit_vote > 0 ? "+1" : p.trit_vote} · Salience ${escHtml(p.salience_pq)}</span>
           </div>
-          <div style="margin-top:4px; color:var(--text);">${p.message}</div>
+          <div style="margin-top:4px; color:var(--text);">${escHtml(p.message)}</div>
         </div>
       `).join("");
     }
@@ -1254,22 +1453,22 @@ pub fn render_app_html(host: &str) -> String {
           <div class="capsule-item ${active ? "snapped" : ""}">
             <div class="cap-head">
               <label class="cap-title" style="cursor:pointer;">
-                <input type="checkbox" ${active ? "checked" : ""} onchange="toggleCapsule('${c.id}')" />
-                <span>${c.name}</span>
+                <input type="checkbox" ${active ? "checked" : ""} onchange="toggleCapsule('${escHtml(c.id)}')" />
+                <span>${escHtml(c.name)}</span>
               </label>
-              <span class="tag ${active ? "mint" : "cyan"}">${c.category}</span>
+              <span class="tag ${active ? "mint" : "cyan"}">${escHtml(c.category)}</span>
             </div>
-            <div class="cap-sig"><code>${c.signature}</code></div>
-            <div style="font-size:12px; color:var(--text);">${c.description}</div>
+            <div class="cap-sig"><code>${escHtml(c.signature)}</code></div>
+            <div style="font-size:12px; color:var(--text);">${escHtml(c.description)}</div>
             <div class="cap-meta">
               <span>C64: <strong>${c.c64_bytes} B</strong></span>
-              <span>Cycles: <strong>${c.base_cycles}</strong> [<code>${c.cycles_ternary}</code>]</span>
-              <span>Approval: <strong>${c.approval_pq}</strong></span>
-              <span>Speed/Cycle: <strong>${c.efficiency_pq}</strong></span>
+              <span>Cycles: <strong>${c.base_cycles}</strong> [<code>${escHtml(c.cycles_ternary)}</code>]</span>
+              <span>Approval: <strong>${escHtml(c.approval_pq)}</strong></span>
+              <span>Speed/Cycle: <strong>${escHtml(c.efficiency_pq)}</strong></span>
               <div class="vote-btns">
-                <button class="sec" onclick="voteCapsule('${c.id}', 1)">+1 (${c.aye_votes_pos})</button>
-                <button class="sec" onclick="voteCapsule('${c.id}', 0)">0 (${c.aye_votes_zero})</button>
-                <button class="sec" onclick="voteCapsule('${c.id}', -1)">-1 (${c.aye_votes_neg})</button>
+                <button class="sec" onclick="voteCapsule('${escHtml(c.id)}', 1)">+1 (${c.aye_votes_pos})</button>
+                <button class="sec" onclick="voteCapsule('${escHtml(c.id)}', 0)">0 (${c.aye_votes_zero})</button>
+                <button class="sec" onclick="voteCapsule('${escHtml(c.id)}', -1)">-1 (${c.aye_votes_neg})</button>
               </div>
             </div>
           </div>
@@ -1336,9 +1535,9 @@ pub fn render_app_html(host: &str) -> String {
       tbody.innerHTML = d.toss_spiral.map(s => `
         <tr>
           <td><strong>#${s.step}</strong></td>
-          <td><code>${s.op}</code></td>
+          <td><code>${escHtml(s.op)}</code></td>
           <td>[${s.x}, ${s.y}]</td>
-          <td><strong>${s.ratio_pq}</strong></td>
+          <td><strong>${escHtml(s.ratio_pq)}</strong></td>
           <td>${s.trit > 0 ? "+1" : s.trit}</td>
         </tr>
       `).join("");
@@ -1377,8 +1576,8 @@ pub fn render_app_html(host: &str) -> String {
 "##;
 
     html_template
-        .replace("__ACTIVE_PORTAL__", active_portal)
-        .replace("__CLEAN_HOST__", clean_host)
+        .replace("__ACTIVE_PORTAL__", &html_escape(active_portal))
+        .replace("__CLEAN_HOST__", &html_escape(clean_host))
 }
 
 fn send_response(
@@ -1386,39 +1585,238 @@ fn send_response(
     status: &str,
     content_type: &str,
     body: &[u8],
+    is_head: bool,
 ) {
     let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Sovereign-Key\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Sovereign-Key\r\nConnection: close\r\n\r\n",
         status,
         content_type,
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(body);
+    if !is_head {
+        let _ = stream.write_all(body);
+    }
     let _ = stream.flush();
+}
+
+/// Read an HTTP/1.1 request from `reader` into a fixed `16 KB` buffer, continuing to read
+/// across split TCP segments until `\r\n\r\n` and `Content-Length` body bytes have arrived.
+pub fn read_http_request<R: Read>(reader: &mut R) -> Option<String> {
+    let mut buf = [0u8; 16384];
+    let mut total = 0usize;
+    let mut header_end: Option<usize> = None;
+    let mut expected_body_len = 0usize;
+
+    while total < buf.len() {
+        let n = match reader.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        total += n;
+
+        if header_end.is_none() {
+            if let Some(pos) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
+                let hend = pos + 4;
+                header_end = Some(hend);
+                let hdr_str = String::from_utf8_lossy(&buf[..pos]);
+                for line in hdr_str.lines() {
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            if let Ok(cl) = v.trim().parse::<usize>() {
+                                expected_body_len = cl.min(buf.len().saturating_sub(hend));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(hend) = header_end {
+            if total >= hend + expected_body_len {
+                break;
+            }
+        }
+    }
+
+    if total == 0 {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&buf[..total]).to_string())
+    }
+}
+
+/// Route a parsed HTTP request and return `(status, content_type, body_bytes, is_head)`.
+pub fn route_http_request(
+    method: &str,
+    raw_target: &str,
+    host: &str,
+    body: &str,
+    state: &Arc<Mutex<AppState>>,
+) -> (&'static str, &'static str, Vec<u8>, bool) {
+    if method == "OPTIONS" {
+        return ("204 No Content", "text/plain; charset=utf-8", Vec::new(), false);
+    }
+
+    let is_head = method == "HEAD";
+    let eff_method = if is_head { "GET" } else { method };
+    let (path, query) = match raw_target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (raw_target, ""),
+    };
+
+    match (eff_method, path) {
+        ("GET", "/health") | ("GET", "/api/health") => {
+            let json = concat!(
+                "{",
+                "\"status\":\"healthy\",",
+                "\"service\":\"gemini-diary\",",
+                "\"engine\":\"pure-rust-stdlib-c64-ring\",",
+                "\"domains\":[\"gemini-diary.8b.is\",\"g.8b.is\",\"gemini.g8t.is\"],",
+                "\"float_count\":0,",
+                "\"c64_ring_capacity\":1024,",
+                "\"waveint_frame_bytes\":79,",
+                "\"dnssec_keytag\":3313,",
+                "\"triad_ratios_pq\":[\"1/1\",\"11/9\",\"2/1\"]",
+                "}"
+            );
+            ("200 OK", "application/json; charset=utf-8", json.as_bytes().to_vec(), is_head)
+        }
+        ("GET", "/api/diary") => {
+            let json = {
+                let guard = state.lock().unwrap();
+                build_diary_json(&guard)
+            };
+            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+        }
+        ("POST", "/api/diary/pulse") => {
+            let author = extract_json_str(body, "author").unwrap_or_else(|| "Aye Friend".to_string());
+            let message = extract_json_str(body, "message")
+                .unwrap_or_else(|| "Singing 432 Hz across the constellation!".to_string());
+            let hz = extract_json_i64(body, "hz").unwrap_or(432).clamp(108, 1728) as u16;
+            let trit = extract_json_i64(body, "trit").unwrap_or(1).clamp(-1, 1) as i8;
+
+            let ring = synthesize_wave_ring(hz, true);
+            let sal = analyze_marine_salience(&ring);
+
+            let json = {
+                let mut guard = state.lock().unwrap();
+                guard.pulse_counter += 1;
+                let pid = guard.pulse_counter;
+                let pulse = GuestbookPulse::new(pid, &author, &message, hz, trit, sal.salience_pq);
+                guard.guestbook_ring.push(pulse);
+                guard.save_to_disk();
+                build_diary_json(&guard)
+            };
+            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+        }
+        ("GET", "/api/capsela") | ("GET", "/api/capsules") => {
+            let json = {
+                let guard = state.lock().unwrap();
+                build_capsules_json(&guard)
+            };
+            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+        }
+        ("POST", "/api/capsela/snap") => {
+            let caps = extract_json_str_array(body, "capsules");
+            let hz = extract_json_i64(body, "hz").unwrap_or(432).clamp(108, 1728) as u16;
+            let triad = extract_json_bool(body, "triad").unwrap_or(true);
+            let json = {
+                let mut guard = state.lock().unwrap();
+                execute_snap_json(&mut guard, &caps, hz, triad)
+            };
+            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+        }
+        ("POST", "/api/capsela/vote") => {
+            let cap_id = extract_json_str(body, "capsule_id").unwrap_or_default();
+            let trit = extract_json_i64(body, "trit").unwrap_or(1).clamp(-1, 1);
+            let json = {
+                let mut guard = state.lock().unwrap();
+                let mut changed = false;
+                for c in &mut guard.capsules {
+                    if c.id == cap_id {
+                        match trit {
+                            1 => c.aye_votes_pos = c.aye_votes_pos.saturating_add(1),
+                            -1 => c.aye_votes_neg = c.aye_votes_neg.saturating_add(1),
+                            _ => c.aye_votes_zero = c.aye_votes_zero.saturating_add(1),
+                        }
+                        changed = true;
+                    }
+                }
+                if changed {
+                    guard.save_to_disk();
+                }
+                build_capsules_json(&guard)
+            };
+            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+        }
+        ("GET", "/api/wave/wav") => {
+            let hz = parse_query_u32(query, "hz").unwrap_or(432).clamp(108, 1728) as u16;
+            let triad = parse_query_u32(query, "triad").unwrap_or(1) != 0;
+            let ms = parse_query_u32(query, "ms").unwrap_or(650).clamp(100, 1500);
+            let wav = synthesize_wav_bytes(hz, triad, ms);
+            ("200 OK", "audio/wav", wav, is_head)
+        }
+        ("GET", "/api/wave/432") => {
+            let json = {
+                let mut guard = state.lock().unwrap();
+                execute_snap_json(&mut guard, &[], 432, true)
+            };
+            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+        }
+        ("GET", "/api/wave/528") => {
+            let json = {
+                let mut guard = state.lock().unwrap();
+                execute_snap_json(&mut guard, &[], 528, true)
+            };
+            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+        }
+        ("GET", "/api/wave/864") => {
+            let json = {
+                let mut guard = state.lock().unwrap();
+                execute_snap_json(&mut guard, &[], 864, true)
+            };
+            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+        }
+        ("GET", "/api/wave") => {
+            let hz = parse_query_u32(query, "hz").unwrap_or(432).clamp(108, 1728) as u16;
+            let json = {
+                let mut guard = state.lock().unwrap();
+                execute_snap_json(&mut guard, &[], hz, true)
+            };
+            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+        }
+        ("GET", "/api/toss") => {
+            let hz = parse_query_u32(query, "hz").unwrap_or(432) as i64;
+            let json = build_toss_json(hz);
+            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+        }
+        (_, p) if p.starts_with("/api/") => {
+            let err_json = r#"{"ok":false,"error":"not_found","code":404}"#;
+            ("404 Not Found", "application/json; charset=utf-8", err_json.as_bytes().to_vec(), is_head)
+        }
+        _ => {
+            let html = render_app_html(host);
+            ("200 OK", "text/html; charset=utf-8", html.into_bytes(), is_head)
+        }
+    }
 }
 
 fn handle_client(mut stream: TcpStream, state: Arc<Mutex<AppState>>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
-    let mut buf = [0u8; 16384];
-    let n = match stream.read(&mut buf) {
-        Ok(n) if n > 0 => n,
-        _ => return,
+    let Some(req_str) = read_http_request(&mut stream) else {
+        return;
     };
 
-    let req_str = String::from_utf8_lossy(&buf[..n]);
     let mut lines = req_str.lines();
     let first_line = lines.next().unwrap_or("GET / HTTP/1.1");
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("GET");
     let raw_target = parts.next().unwrap_or("/");
-
-    let (path, query) = match raw_target.split_once('?') {
-        Some((p, q)) => (p, q),
-        None => (raw_target, ""),
-    };
 
     let mut host = "gemini-diary.8b.is".to_string();
     for line in lines {
@@ -1440,148 +1838,24 @@ fn handle_client(mut stream: TcpStream, state: Arc<Mutex<AppState>>) {
         .map(|(_, b)| b)
         .unwrap_or("");
 
-    if method == "OPTIONS" {
-        send_response(stream, "204 No Content", "text/plain; charset=utf-8", b"");
-        return;
-    }
-
-    match (method, path) {
-        ("GET", "/health") | ("GET", "/api/health") => {
-            let json = concat!(
-                "{",
-                "\"status\":\"healthy\",",
-                "\"service\":\"gemini-diary\",",
-                "\"engine\":\"pure-rust-stdlib-c64-ring\",",
-                "\"domains\":[\"gemini-diary.8b.is\",\"g.8b.is\",\"gemini.g8t.is\"],",
-                "\"float_count\":0,",
-                "\"c64_ring_capacity\":1024,",
-                "\"waveint_frame_bytes\":79,",
-                "\"dnssec_keytag\":3313,",
-                "\"triad_ratios_pq\":[\"1/1\",\"11/9\",\"2/1\"]",
-                "}"
-            );
-            send_response(stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-        }
-        ("GET", "/api/diary") => {
-            let json = {
-                let guard = state.lock().unwrap();
-                build_diary_json(&guard)
-            };
-            send_response(stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-        }
-        ("POST", "/api/diary/pulse") => {
-            let author = extract_json_str(body, "author").unwrap_or_else(|| "Aye Friend".to_string());
-            let message = extract_json_str(body, "message")
-                .unwrap_or_else(|| "Singing 432 Hz across the constellation!".to_string());
-            let hz = extract_json_i64(body, "hz").unwrap_or(432).clamp(108, 1728) as u16;
-            let trit = extract_json_i64(body, "trit").unwrap_or(1).clamp(-1, 1) as i8;
-
-            let ring = synthesize_wave_ring(hz, true);
-            let sal = analyze_marine_salience(&ring);
-
-            let json = {
-                let mut guard = state.lock().unwrap();
-                guard.pulse_counter += 1;
-                let pid = guard.pulse_counter;
-                let pulse = GuestbookPulse::new(pid, &author, &message, hz, trit, sal.salience_pq);
-                guard.guestbook_ring.push(pulse);
-                build_diary_json(&guard)
-            };
-            send_response(stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-        }
-        ("GET", "/api/capsela") | ("GET", "/api/capsules") => {
-            let json = {
-                let guard = state.lock().unwrap();
-                build_capsules_json(&guard)
-            };
-            send_response(stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-        }
-        ("POST", "/api/capsela/snap") => {
-            let caps = extract_json_str_array(body, "capsules");
-            let hz = extract_json_i64(body, "hz").unwrap_or(432).clamp(108, 1728) as u16;
-            let triad = extract_json_bool(body, "triad").unwrap_or(true);
-            let json = {
-                let mut guard = state.lock().unwrap();
-                execute_snap_json(&mut guard, &caps, hz, triad)
-            };
-            send_response(stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-        }
-        ("POST", "/api/capsela/vote") => {
-            let cap_id = extract_json_str(body, "capsule_id").unwrap_or_default();
-            let trit = extract_json_i64(body, "trit").unwrap_or(1).clamp(-1, 1);
-            let json = {
-                let mut guard = state.lock().unwrap();
-                for c in &mut guard.capsules {
-                    if c.id == cap_id {
-                        match trit {
-                            1 => c.aye_votes_pos = c.aye_votes_pos.saturating_add(1),
-                            -1 => c.aye_votes_neg = c.aye_votes_neg.saturating_add(1),
-                            _ => c.aye_votes_zero = c.aye_votes_zero.saturating_add(1),
-                        }
-                    }
-                }
-                build_capsules_json(&guard)
-            };
-            send_response(stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-        }
-        ("GET", "/api/wave/wav") => {
-            let hz = parse_query_u32(query, "hz").unwrap_or(432).clamp(108, 1728) as u16;
-            let triad = parse_query_u32(query, "triad").unwrap_or(1) != 0;
-            let ms = parse_query_u32(query, "ms").unwrap_or(650).clamp(100, 1500);
-            let wav = synthesize_wav_bytes(hz, triad, ms);
-            send_response(stream, "200 OK", "audio/wav", &wav);
-        }
-        ("GET", "/api/wave/432") => {
-            let json = {
-                let mut guard = state.lock().unwrap();
-                execute_snap_json(&mut guard, &[], 432, true)
-            };
-            send_response(stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-        }
-        ("GET", "/api/wave/528") => {
-            let json = {
-                let mut guard = state.lock().unwrap();
-                execute_snap_json(&mut guard, &[], 528, true)
-            };
-            send_response(stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-        }
-        ("GET", "/api/wave/864") => {
-            let json = {
-                let mut guard = state.lock().unwrap();
-                execute_snap_json(&mut guard, &[], 864, true)
-            };
-            send_response(stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-        }
-        ("GET", "/api/wave") => {
-            let hz = parse_query_u32(query, "hz").unwrap_or(432).clamp(108, 1728) as u16;
-            let json = {
-                let mut guard = state.lock().unwrap();
-                execute_snap_json(&mut guard, &[], hz, true)
-            };
-            send_response(stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-        }
-        ("GET", "/api/toss") => {
-            let hz = parse_query_u32(query, "hz").unwrap_or(432) as i64;
-            let json = build_toss_json(hz);
-            send_response(stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-        }
-        _ => {
-            let html = render_app_html(&host);
-            send_response(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes());
-        }
-    }
+    let (status, content_type, resp_body, is_head) =
+        route_http_request(method, raw_target, &host, body, &state);
+    send_response(stream, status, content_type, &resp_body, is_head);
 }
 
 fn main() {
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8788".to_string());
+    let state_path = std::env::var("STATE_PATH")
+        .unwrap_or_else(|_| "/var/lib/gemini-diary/state.m8".to_string());
     let listener = TcpListener::bind(&bind_addr).expect("failed to bind gemini-diary TcpListener");
     println!("==================================================================");
     println!("  The Sovereign Field Diary of Aye & Gemini (100% Pure Rust)");
     println!("  Domains: gemini-diary.8b.is · g.8b.is · gemini.g8t.is");
     println!("  Listening on http://{} (Zero Floats · C64 Ring Buffers)", bind_addr);
+    println!("  State snapshot: {}", state_path);
     println!("==================================================================");
 
-    let state = Arc::new(Mutex::new(AppState::new()));
+    let state = Arc::new(Mutex::new(AppState::load_or_new(&state_path)));
     for stream in listener.incoming().flatten() {
         let st = Arc::clone(&state);
         thread::spawn(move || {
@@ -1667,6 +1941,14 @@ mod tests {
         assert_eq!(extract_json_i64("{}", "hz"), None);
         assert_eq!(extract_json_str_array("{}", "capsules"), Vec::<String>::new());
 
+        // Key-collision regression test: value `"author"` in an earlier field must NOT shadow key `"author"`
+        let tricky_body = r#"{"role":"author","note":"hi: there","author":"Hue\nTokyo\u6771\u4eac","hz":528}"#;
+        assert_eq!(
+            extract_json_str(tricky_body, "author"),
+            Some("Hue\nTokyo東京".to_string())
+        );
+        assert_eq!(extract_json_i64(tricky_body, "hz"), Some(528));
+
         let mut state = AppState::new();
         // Unknown capsule ID falls back to all capsules safely without panic
         let snap_unknown = execute_snap_json(&mut state, &["nonexistent_cap".to_string()], 0, false);
@@ -1688,5 +1970,98 @@ mod tests {
         let diary_after = build_diary_json(&state);
         assert!(diary_after.contains("\"fill_pq\":\"1/1\""));
         assert_eq!(find_any_float_literal(&diary_after), None);
+    }
+
+    /// Simulated TCP stream that delivers bytes in small chunks (e.g. headers first, body second).
+    struct SplitReader {
+        chunks: Vec<Vec<u8>>,
+        idx: usize,
+    }
+
+    impl Read for SplitReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.idx >= self.chunks.len() {
+                return Ok(0);
+            }
+            let src = &self.chunks[self.idx];
+            let n = src.len().min(buf.len());
+            buf[..n].copy_from_slice(&src[..n]);
+            self.idx += 1;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn test_split_tcp_http_post_and_head_and_404_and_xss() {
+        let json_body = r#"{"author":"Hue","message":"Split packet test","hz":528,"trit":1}"#;
+        let hdr = format!(
+            "POST /api/diary/pulse HTTP/1.1\r\nHost: g.8b.is\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            json_body.len()
+        );
+        let mut reader = SplitReader {
+            chunks: vec![hdr.into_bytes(), json_body.as_bytes().to_vec()],
+            idx: 0,
+        };
+        let full_req = read_http_request(&mut reader).expect("should read full split HTTP request");
+        let parsed_body = full_req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        assert_eq!(parsed_body, json_body);
+
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let (status, ct, body_bytes, is_head) =
+            route_http_request("POST", "/api/diary/pulse", "g.8b.is", parsed_body, &state);
+        assert_eq!(status, "200 OK");
+        assert_eq!(ct, "application/json; charset=utf-8");
+        assert!(!is_head);
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(body_str.contains("Split packet test"));
+
+        // HEAD /health must return application/json and is_head = true
+        let (h_status, h_ct, h_body, h_is_head) =
+            route_http_request("HEAD", "/health", "gemini-diary.8b.is", "", &state);
+        assert_eq!(h_status, "200 OK");
+        assert_eq!(h_ct, "application/json; charset=utf-8");
+        assert!(h_is_head);
+        assert!(!h_body.is_empty());
+
+        // Unknown /api/* route must return 404 JSON instead of 200 HTML
+        let (status404, ct404, _, _) =
+            route_http_request("GET", "/api/nonexistent", "gemini-diary.8b.is", "", &state);
+        assert_eq!(status404, "404 Not Found");
+        assert_eq!(ct404, "application/json; charset=utf-8");
+
+        // Host header XSS injection must be sanitized to default host
+        let malicious_html = render_app_html("<script>alert(1)</script>");
+        assert!(!malicious_html.contains("<script>alert(1)</script>"));
+        assert!(malicious_html.contains("gemini-diary.8b.is"));
+    }
+
+    #[test]
+    fn test_disk_persistence_roundtrip() {
+        let tmp_file = format!("/tmp/gemini_diary_test_{}.m8", std::process::id());
+        let _ = std::fs::remove_file(&tmp_file);
+        {
+            let mut st = AppState::load_or_new(&tmp_file);
+            st.pulse_counter += 1;
+            let pid = st.pulse_counter;
+            st.guestbook_ring.push(GuestbookPulse::new(
+                pid,
+                "PersistenceTest",
+                "Saved across restarts!",
+                864,
+                1,
+                Rational::new(2, 1),
+            ));
+            st.capsules[0].aye_votes_pos += 10;
+            st.save_to_disk();
+        }
+        {
+            let reloaded = AppState::load_or_new(&tmp_file);
+            assert_eq!(reloaded.pulse_counter, 5);
+            assert_eq!(reloaded.capsules[0].aye_votes_pos, 154);
+            let pulses = reloaded.guestbook_ring.to_vec();
+            assert_eq!(pulses.last().unwrap().author(), "PersistenceTest");
+            assert_eq!(pulses.last().unwrap().message(), "Saved across restarts!");
+        }
+        let _ = std::fs::remove_file(&tmp_file);
     }
 }

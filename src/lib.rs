@@ -395,8 +395,8 @@ pub fn integer_goertzel_energy(samples: &[i16], target_hz: u32) -> i64 {
     if samples.is_empty() {
         return 0;
     }
-    // Phase step in tenths of a degree per sample: (target_hz * 3600) / 16000
-    let step_deg10 = (target_hz * 3600) / SAMPLE_RATE_HZ;
+    // Phase step in tenths of a degree per sample, rounded to nearest: (target_hz * 3600 + 8000) / 16000
+    let step_deg10 = (target_hz.saturating_mul(3600).saturating_add(SAMPLE_RATE_HZ / 2)) / SAMPLE_RATE_HZ;
     // cos(theta) = sin(theta + 90 deg)
     let cos_q15 = integer_sine_q15(step_deg10 + 900) as i64;
     // 2 * cos(theta) in Q14 is simply cos_q15! (since cos_q15 = 32767 * cos = 2 * 16383.5 * cos)
@@ -506,7 +506,7 @@ pub fn analyze_marine_salience(ring: &RingBuffer<i16, 1024>) -> MarineSalienceRe
 
     let trits_9 = [
         trit_gate,
-        if e432 >= e528 { 1 } else { 0 },
+        if e432 > 0 { 1 } else { 0 },
         if e528 > 0 { 1 } else { -1 },
         if e864 > 0 { 1 } else { 0 },
         if jitter_pq.p * 4 <= jitter_pq.q { 1 } else { -1 },
@@ -528,6 +528,18 @@ pub fn analyze_marine_salience(ring: &RingBuffer<i16, 1024>) -> MarineSalienceRe
         trit_gate,
         trits_9,
     }
+}
+
+/// Truncate a UTF-8 string slice to at most `max_bytes` bytes at a valid character boundary.
+pub fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 // ============================================================================
@@ -576,13 +588,19 @@ impl WaveIntFrame {
         cycle_tick: u64,
         tag: &str,
     ) -> Self {
+        let mut clamped_trits = [0i8; 9];
+        for i in 0..9 {
+            clamped_trits[i] = gaia_trits[i].clamp(-1, 1);
+        }
+        let clean_tag: String = tag.chars().filter(|&c| c != '\0').collect();
+        let capsule_tag = truncate_utf8_bytes(&clean_tag, 46).to_string();
         let mut frame = Self {
             carrier_hz,
             salience_p: salience.p.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             salience_q: salience.q.clamp(1, i32::MAX as i64) as i32,
-            gaia_trits,
+            gaia_trits: clamped_trits,
             cycle_tick,
-            capsule_tag: tag.chars().take(46).collect(),
+            capsule_tag,
             crc8: 0,
         };
         let raw = frame.to_bytes();
@@ -602,9 +620,9 @@ impl WaveIntFrame {
             buf[15 + i] = (t.clamp(-1, 1) + 1) as u8; // encoded as 0, 1, 2
         }
         buf[24..32].copy_from_slice(&self.cycle_tick.to_be_bytes());
-        let tag_bytes = self.capsule_tag.as_bytes();
-        let copy_len = tag_bytes.len().min(46);
-        buf[32..32 + copy_len].copy_from_slice(&tag_bytes[..copy_len]);
+        let safe_tag = truncate_utf8_bytes(&self.capsule_tag, 46);
+        let tag_bytes = safe_tag.as_bytes();
+        buf[32..32 + tag_bytes.len()].copy_from_slice(tag_bytes);
 
         let mut prefix = [0u8; 78];
         prefix.copy_from_slice(&buf[0..78]);
@@ -630,8 +648,14 @@ impl WaveIntFrame {
         let carrier_hz = u16::from_be_bytes([raw[5], raw[6]]);
         let salience_p = i32::from_be_bytes([raw[7], raw[8], raw[9], raw[10]]);
         let salience_q = i32::from_be_bytes([raw[11], raw[12], raw[13], raw[14]]);
+        if salience_q <= 0 {
+            return Err("MEM8 WaveInt denominator salience_q must be > 0");
+        }
         let mut gaia_trits = [0i8; 9];
         for i in 0..9 {
+            if raw[15 + i] > 2 {
+                return Err("MEM8 WaveInt trit byte out of balanced ternary range 0..=2");
+            }
             gaia_trits[i] = (raw[15 + i] as i8) - 1;
         }
         let cycle_tick = u64::from_be_bytes([
@@ -642,7 +666,9 @@ impl WaveIntFrame {
             .position(|&b| b == 0)
             .map(|p| 32 + p)
             .unwrap_or(78);
-        let capsule_tag = String::from_utf8_lossy(&raw[32..tag_end]).to_string();
+        let capsule_tag = std::str::from_utf8(&raw[32..tag_end])
+            .map_err(|_| "MEM8 WaveInt capsule_tag is not valid UTF-8")?
+            .to_string();
 
         Ok(Self {
             carrier_hz,
@@ -1036,28 +1062,32 @@ impl GuestbookPulse {
             id,
             freq_hz: freq_hz.clamp(108, 1728),
             trit_vote: trit_vote.clamp(-1, 1),
-            salience_p: salience.p as i32,
-            salience_q: salience.q.max(1) as i32,
+            salience_p: salience.p.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            salience_q: salience.q.clamp(1, i32::MAX as i64) as i32,
             ..Self::default()
         };
-        let a_bytes = author.trim().as_bytes();
-        let a_len = a_bytes.len().min(24);
-        p.author_bytes[..a_len].copy_from_slice(&a_bytes[..a_len]);
-        p.author_len = a_len as u8;
+        let clean_author: String = author.trim().chars().filter(|&c| c != '\0').collect();
+        let a_str = truncate_utf8_bytes(&clean_author, 24);
+        let a_bytes = a_str.as_bytes();
+        p.author_bytes[..a_bytes.len()].copy_from_slice(a_bytes);
+        p.author_len = a_bytes.len() as u8;
 
-        let m_bytes = message.trim().as_bytes();
-        let m_len = m_bytes.len().min(96);
-        p.message_bytes[..m_len].copy_from_slice(&m_bytes[..m_len]);
-        p.message_len = m_len as u8;
+        let clean_msg: String = message.trim().chars().filter(|&c| c != '\0').collect();
+        let m_str = truncate_utf8_bytes(&clean_msg, 96);
+        let m_bytes = m_str.as_bytes();
+        p.message_bytes[..m_bytes.len()].copy_from_slice(m_bytes);
+        p.message_len = m_bytes.len() as u8;
         p
     }
 
     pub fn author(&self) -> String {
-        String::from_utf8_lossy(&self.author_bytes[..self.author_len as usize]).to_string()
+        let len = (self.author_len as usize).min(24);
+        String::from_utf8_lossy(&self.author_bytes[..len]).to_string()
     }
 
     pub fn message(&self) -> String {
-        String::from_utf8_lossy(&self.message_bytes[..self.message_len as usize]).to_string()
+        let len = (self.message_len as usize).min(96);
+        String::from_utf8_lossy(&self.message_bytes[..len]).to_string()
     }
 }
 
@@ -1108,16 +1138,20 @@ mod tests {
 
     #[test]
     fn test_marine_salience_and_wave_synthesis() {
-        let ring = synthesize_wave_ring(432, true);
-        assert_eq!(ring.len(), 1024);
-        let report = analyze_marine_salience(&ring);
-        assert_eq!(report.trit_gate, 1);
-        assert!(report.salience_pq.p * 10 >= report.salience_pq.q * 6);
-        assert!(report.harmonic_432_pq.p > 0);
+        for &hz in &[432u16, 528, 864] {
+            let ring = synthesize_wave_ring(hz, true);
+            assert_eq!(ring.len(), 1024);
+            let report = analyze_marine_salience(&ring);
+            assert_eq!(report.trit_gate, 1);
+            assert!(report.salience_pq.p * 10 >= report.salience_pq.q * 6);
+            assert_eq!(report.trits_9[1], 1);
+            assert_eq!(report.trits_9[2], 1);
+            assert_eq!(report.trits_9[3], 1);
+        }
     }
 
     #[test]
-    fn test_mem8_waveint_79_byte_roundtrip() {
+    fn test_mem8_waveint_79_byte_roundtrip_and_multibyte_utf8() {
         let frame = WaveIntFrame::new(
             432,
             Rational::new(11, 9),
@@ -1130,6 +1164,41 @@ mod tests {
         let decoded = WaveIntFrame::from_bytes(&bytes).expect("valid 79-byte WaveInt frame");
         assert_eq!(decoded, frame);
         assert_eq!(frame.to_hex().len(), 158);
+
+        // Multi-byte Japanese UTF-8 & NUL byte stress test near 46-byte boundary
+        let jp_tag = "東京バルコニー\0・432Hz・528Hz・864Hz・TOSS・MEM8・WaveInt・Omni";
+        let jp_frame = WaveIntFrame::new(528, Rational::new(1, 1), [99, -99, 0, 1, -1, 1, 0, 1, 1], 79, jp_tag);
+        assert!(jp_frame.capsule_tag.len() <= 46);
+        assert!(!jp_frame.capsule_tag.contains('\u{FFFD}'));
+        let jp_bytes = jp_frame.to_bytes();
+        let jp_decoded = WaveIntFrame::from_bytes(&jp_bytes).expect("valid multi-byte UTF-8 WaveInt frame");
+        assert_eq!(jp_decoded, jp_frame);
+
+        // Invalid trit byte (> 2) must be rejected even with recalculated CRC-8
+        let mut bad_trit = jp_bytes;
+        bad_trit[15] = 9;
+        let mut prefix = [0u8; 78];
+        prefix.copy_from_slice(&bad_trit[0..78]);
+        bad_trit[78] = WaveIntFrame::compute_crc8(&prefix);
+        assert!(WaveIntFrame::from_bytes(&bad_trit).is_err());
+
+        // Invalid salience_q <= 0 must be rejected
+        let mut bad_q = jp_bytes;
+        bad_q[11..15].copy_from_slice(&0i32.to_be_bytes());
+        prefix.copy_from_slice(&bad_q[0..78]);
+        bad_q[78] = WaveIntFrame::compute_crc8(&prefix);
+        assert!(WaveIntFrame::from_bytes(&bad_q).is_err());
+    }
+
+    #[test]
+    fn test_guestbook_pulse_multibyte_utf8_truncation() {
+        let author = "東京のピーター・オムニ・バルコニー・8b.is";
+        let msg = "０９：００ＪＳＴ東京バルコニーから愛を込めて！４３２Ｈｚ・５２８Ｈｚ・８６４Ｈｚの完全整数調和トライアドとＭＥＭ｜８の７９バイトフレーム！";
+        let pulse = GuestbookPulse::new(1, author, msg, 528, 1, Rational::new(11, 9));
+        assert!(pulse.author().len() <= 24);
+        assert!(pulse.message().len() <= 96);
+        assert!(!pulse.author().contains('\u{FFFD}'));
+        assert!(!pulse.message().contains('\u{FFFD}'));
     }
 
     #[test]
