@@ -130,8 +130,20 @@ def check_diary(local_only: bool) -> None:
         record("diary", f"portal {host.split('//')[1]}", OK if ok else FAIL, f"{st} {ms}ms")
 
 
+def _skip_section(section: str, why: str, names: list[str]) -> None:
+    for n in names:
+        record(section, n, SKIP, why, required=False)
+
+
+def _have(cmd: str) -> bool:
+    return run(["sh", "-c", f"command -v {cmd}"], timeout=10)[0] == 0
+
+
 def check_ports() -> None:
     """Who owns the ports the constellation shares. Three services want 8788."""
+    if not _have("lsof"):
+        _skip_section("ports", "lsof not installed here", ["port ownership"])
+        return
     wanted = {8787: "wa webhook", 8788: "wa raw duplex (canonical) · diary default · memnet",
               8789: "mux http", 8790: "diary webhook shift", 8797: "wa raw duplex (actual)",
               8811: "diary (local run)", 8080: "ollama", 4222: "nats"}
@@ -156,6 +168,9 @@ def check_ports() -> None:
 
 
 def check_stream() -> None:
+    if not WA.exists():
+        _skip_section("stream", "wa-stream not on this host", ["sidecar running", "watchers", "launchd"])
+        return
     rc, out = run(["pgrep", "-fl", "node sidecar.ts"])
     record("stream", "sidecar running", OK if rc == 0 else FAIL,
            out.splitlines()[0] if out else "not running")
@@ -176,6 +191,9 @@ def check_stream() -> None:
 
 
 def check_music_lane() -> None:
+    if not WA.exists():
+        _skip_section("music", "wa-stream not on this host", ["quant signs", "music-lane posts", "hf identity"])
+        return
     if SIGNS.exists():
         n = len(list(SIGNS.glob("*.json")))
         record("music", "quant signs", OK, f"{n} files")
