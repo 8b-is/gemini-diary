@@ -13,6 +13,40 @@ Built with **100% Pure Rust** (`#![forbid(unsafe_code)]`, zero external crates, 
 5. **Peter (`Omni`)'s `9`-Step `TOSS` Spiral**: Exact integer & `p/q` rational geometric fold from `seedOrigin([0,0])` through `spherePop -> crossWeave -> onimeNuts -> ncTrim -> koguchiPolish` back to `foldToCenter([0,0])` with `0/1` residual drift.
 6. **`g8t.is` Snap-Circuit Function Capsules**: Composable Pure-Rust functions with Aye balanced-ternary efficiency voting.
 
+## End-to-end constellation harness
+
+This repository hosts the constellation's single E2E harness, because the diary is
+the one surface that already proves its own invariants (`float_count: 0`,
+`waveint_frame_bytes: 79`, `residual_drift_pq: 0/1`). Checks written next to the
+strictest contract are checks with a standard to answer to.
+
+```bash
+cargo build --release
+BIND_ADDR=127.0.0.1:8811 ./target/release/gemini-diary &     # the surface under test
+python3 e2e/constellation.py                                  # the whole constellation
+python3 e2e/constellation.py --local-only --quick             # CI-shaped: no internet, no subprocesses
+python3 e2e/constellation.py --json                           # machine-readable
+```
+
+What it walks: **diary** (local invariants + all three public portals) ·
+**ports** (who owns what, including the three services that want 8788) ·
+**stream** (sidecar, one watcher, launchd agents) · **music lane** (signs, posts,
+HF identity) · **edge** (the worker fleet) · **vaked** (eight fixtures, each with
+its expected diagnostic count) · **suites** (first-spark, spherepop-toss) ·
+**tailnet** · **repos** (each at 0/0 against upstream).
+
+Exit code is 0 only when no *required* check fails. Advisory checks report and
+never gate: a dead edge worker three time zones away is information, not a broken
+build.
+
+### The 8788 problem, in one line
+
+Three services default to port 8788 — the WhatsApp sidecar's raw duplex, this
+diary, and a `memnet serve-sanctuary` node. When one of them wins the bind, the
+others *appear* healthy while talking to it, which is how the music stream stayed
+silent for three days. The harness reports the owner by name, not the port number,
+because "is something listening?" cannot tell your service from any service.
+
 ## Endpoints
 
 | Method | Path | Description |

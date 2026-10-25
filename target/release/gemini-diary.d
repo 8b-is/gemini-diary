@@ -1,0 +1,1 @@
+/Users/lodripeter/workspace/peterlodri-sec/gemini-diary/target/release/gemini-diary: /Users/lodripeter/workspace/peterlodri-sec/gemini-diary/src/lib.rs /Users/lodripeter/workspace/peterlodri-sec/gemini-diary/src/main.rs

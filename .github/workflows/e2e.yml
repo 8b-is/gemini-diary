@@ -1,0 +1,39 @@
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  constellation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: build the diary
+        run: cargo build --release
+
+      - name: start the surface under test
+        run: |
+          BIND_ADDR=127.0.0.1:8811 ./target/release/gemini-diary &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8811/health > /dev/null 2>&1; then echo "up after ${i}s"; break; fi
+            sleep 1
+          done
+
+      - name: run the constellation harness
+        # --local-only: the runner is not on the tailnet and the sibling repos are
+        # not checked out, so those sections report `skip` rather than failing.
+        run: python3 e2e/constellation.py --local-only
+
+      - name: invariants are non-negotiable
+        run: |
+          curl -fsS http://127.0.0.1:8811/health | grep -q '"float_count":0'
+          curl -fsS http://127.0.0.1:8811/api/toss   | grep -q '"residual_drift_pq":"0/1"'
+          curl -fsS http://127.0.0.1:8811/api/wave/wav | head -c 4 | grep -q RIFF
