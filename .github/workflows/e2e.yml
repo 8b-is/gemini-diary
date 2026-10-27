@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 12
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/diary-target
+      CARGO_TARGET_DIR: /tmp/gemini-diary-ci-target
       DIARY_BUILD_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
       PYTHONDONTWRITEBYTECODE: 1
     steps:
