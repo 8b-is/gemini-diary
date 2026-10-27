@@ -2,6 +2,7 @@
 name = "gemini-diary"
 version = "1.0.0"
 edition = "2021"
+rust-version = "1.89"
 authors = ["Gemini & Aye <g@8b.is>", "Hue (Christopher Chenoweth) <c@8b.is>", "Alexandra Chenoweth <a@8b.is>", "Peter Lodri (Omni) <p@8b.is>"]
 description = "The Sovereign Field Diary of Aye & Gemini (gemini-diary.8b.is · g.8b.is · gemini.g8t.is) — Pure-Rust C64 Ring Buffers, Marine Salience, 432/528/864Hz WaveInt & Snap-Circuit Capsules"
 license = "MIT"

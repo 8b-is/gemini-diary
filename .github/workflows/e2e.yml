@@ -11,29 +11,34 @@ jobs:
   constellation:
     runs-on: ubuntu-24.04
     timeout-minutes: 12
+    env:
+      CARGO_TARGET_DIR: /tmp/gemini-diary-ci-target
+      DIARY_BUILD_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+      PYTHONDONTWRITEBYTECODE: 1
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust checks
+        run: |
+          cargo fmt --check
+          cargo test
+          cargo clippy --all-targets -- -D warnings
+
+      - name: publisher regression checks
+        run: python3 -m unittest discover -s scripts -v
 
       - name: build the diary
         run: cargo build --release
 
-      - name: start the surface under test
+      - name: install browser test runtime
         run: |
-          BIND_ADDR=127.0.0.1:8811 ./target/release/gemini-diary &
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8811/health > /dev/null 2>&1; then echo "up after ${i}s"; break; fi
-            sleep 1
-          done
+          python3 -m venv "$RUNNER_TEMP/diary-browser"
+          "$RUNNER_TEMP/diary-browser/bin/pip" install playwright==1.64.1
+          "$RUNNER_TEMP/diary-browser/bin/python" -m playwright install --with-deps chromium
 
-      - name: run the constellation harness
-        # --local-only: the runner is not on the tailnet and the sibling repos are
-        # not checked out, so those sections report `skip` rather than failing.
-        run: python3 e2e/constellation.py --local-only
-
-      - name: invariants are non-negotiable
-        run: |
-          curl -fsS http://127.0.0.1:8811/health | grep -q '"float_count":0'
-          curl -fsS http://127.0.0.1:8811/api/toss   | grep -q '"residual_drift_pq":"0/1"'
-          curl -fsS http://127.0.0.1:8811/api/wave/wav | head -c 4 | grep -q RIFF
+      - name: isolated HTTP, restart, constellation and browser contracts
+        run: '"$RUNNER_TEMP/diary-browser/bin/python" e2e/diary.py --browser'

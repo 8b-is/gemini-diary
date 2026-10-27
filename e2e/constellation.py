@@ -10,10 +10,8 @@ Exit code is 0 only when no *required* check fails. Advisory checks are reported
 and never gate: a dead edge worker three time zones away is information, not a
 broken build.
 
-Why this lives in gemini-diary: the diary is the constellation's only surface that
-already proves its own invariants (`float_count: 0`, `waveint_frame_bytes: 79`,
-`residual_drift_pq: 0/1`). Putting the harness next to the surface with the
-strictest contract means the checks are written in the presence of a standard.
+The diary checks exercise service identity, a codec self-check and unsigned-frame
+reporting. A health response is not a runtime numeric audit or hardware proof.
 
 Standard library only. No floating point in the output: counts are integers,
 latencies are integer milliseconds, and ratios are printed as p/q.
@@ -35,7 +33,7 @@ import urllib.request
 
 HOME = pathlib.Path.home()
 WS = HOME / "workspace" / "peterlodri-sec"
-DIARY = WS / "gemini-diary"
+DIARY = pathlib.Path(__file__).resolve().parents[1]
 VAKED = WS / "vaked"
 FIRST_SPARK = WS / "first-spark"
 SPHEREPOP = WS / "spherepop-toss"
@@ -54,16 +52,16 @@ def record(section: str, name: str, status: str, detail: str = "", required: boo
 
 
 def http(url: str, timeout: int = 12) -> tuple[int | str, bytes, int]:
-    t0 = time.monotonic()
+    t0 = time.monotonic_ns()
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "constellation-e2e/1"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read()
-        return r.status, body, int((time.monotonic() - t0) * 1000)
+        return r.status, body, (time.monotonic_ns() - t0) // 1_000_000
     except urllib.error.HTTPError as e:
-        return e.code, b"", int((time.monotonic() - t0) * 1000)
+        return e.code, b"", (time.monotonic_ns() - t0) // 1_000_000
     except Exception as e:  # noqa: BLE001 - the whole point is to classify failures
-        return type(e).__name__, b"", int((time.monotonic() - t0) * 1000)
+        return type(e).__name__, b"", (time.monotonic_ns() - t0) // 1_000_000
 
 
 def run(cmd: list[str], cwd: pathlib.Path | None = None, timeout: int = 300) -> tuple[int, str]:
@@ -83,7 +81,7 @@ def run(cmd: list[str], cwd: pathlib.Path | None = None, timeout: int = 300) -> 
 
 def check_diary(local_only: bool) -> None:
     """The host surface: its own invariants, locally and on all three portals."""
-    binp = DIARY / "target" / "release" / "gemini-diary"
+    binp = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", str(DIARY / "target"))) / "release" / "gemini-diary"
     if binp.exists():
         record("diary", "release binary present", OK, f"{binp.stat().st_size} bytes")
     else:
@@ -95,8 +93,11 @@ def check_diary(local_only: bool) -> None:
         try:
             j = json.loads(body)
             record("diary", "local /health", OK, f"{ms}ms")
-            record("diary", "float_count == 0", OK if j.get("float_count") == 0 else FAIL,
-                   str(j.get("float_count")))
+            record("diary", "service identity and evidence contract",
+                   OK if j.get("service") == "gemini-diary" and j.get("schema_version") == 2
+                   and j.get("waveint_roundtrip_verified") is True and j.get("signature_status") == "unsigned"
+                   and j.get("runtime_numeric_audit") == "not_performed" else FAIL,
+                   str(j.get("build_revision")))
             record("diary", "waveint_frame_bytes == 79",
                    OK if j.get("waveint_frame_bytes") == 79 else FAIL,
                    str(j.get("waveint_frame_bytes")))
@@ -119,14 +120,18 @@ def check_diary(local_only: bool) -> None:
                OK if st == 200 and body[:4] == b"RIFF" else FAIL,
                f"{len(body)} bytes")
     else:
-        record("diary", "local /health", SKIP, f"{st} (start it: BIND_ADDR={bind} ./target/release/gemini-diary)")
+        record("diary", "local /health", FAIL, f"{st} (start it: BIND_ADDR={bind} {binp})")
 
     if local_only:
         record("diary", "public portals", SKIP, "--local-only", required=False)
         return
     for host in ("https://gemini-diary.8b.is", "https://g.8b.is", "https://gemini.g8t.is"):
         st, body, ms = http(host + "/health", timeout=15)
-        ok = st == 200 and b'"float_count":0' in body.replace(b" ", b"")
+        try:
+            data = json.loads(body)
+            ok = st == 200 and data.get("service") == "gemini-diary" and data.get("waveint_roundtrip_verified") is True
+        except ValueError:
+            ok = False
         record("diary", f"portal {host.split('//')[1]}", OK if ok else FAIL, f"{st} {ms}ms")
 
 
@@ -193,7 +198,7 @@ def check_stream() -> None:
            f"{len(loaded)} agent(s)", required=False)
 
 
-def check_music_lane() -> None:
+def check_music_lane(local_only: bool) -> None:
     if not WA.exists():
         _skip_section("music", "wa-stream not on this host", ["quant signs", "music-lane posts", "hf identity"])
         return
@@ -205,6 +210,9 @@ def check_music_lane() -> None:
     if POCCO.exists():
         posts = sorted((POCCO / "posts").glob("*.md"))
         record("music", "music-lane posts", OK, f"{len(posts)} posts")
+    if local_only:
+        record("music", "hf identity", SKIP, "--local-only", required=False)
+        return
     rc, out = run(["hf", "auth", "whoami"], timeout=30)
     record("music", "hf identity", OK if rc == 0 else WARN, out.splitlines()[0] if out else "", required=False)
 
@@ -290,7 +298,7 @@ def check_tailnet() -> None:
            f"{len(online)} of {len(peers)}", required=False)
 
 
-def check_repos() -> None:
+def check_repos(local_only: bool) -> None:
     """Every repo this constellation claims should be at 0/0 against its upstream."""
     repos = ["vaked", "pocoo.vaked.dev", "wa-stream", "first-spark", "spherepop-toss",
              "kompress-ultra", "gemini-diary"]
@@ -299,7 +307,8 @@ def check_repos() -> None:
         if not (p / ".git").exists():
             record("repos", r, SKIP, "not present", required=False)
             continue
-        run(["git", "fetch", "-q", "origin"], cwd=p, timeout=60)
+        if not local_only:
+            run(["git", "fetch", "-q", "origin"], cwd=p, timeout=60)
         rc, out = run(["git", "rev-list", "--left-right", "--count", "origin/main...HEAD"], cwd=p, timeout=30)
         if rc != 0:
             record("repos", r, WARN, "no origin/main", required=False)
@@ -357,12 +366,12 @@ def main(argv: list[str]) -> int:
     check_diary(args.local_only)
     check_ports()
     check_stream()
-    check_music_lane()
+    check_music_lane(args.local_only)
     check_edge(args.local_only)
     check_vaked(args.quick)
     check_suites(args.quick)
     check_tailnet()
-    check_repos()
+    check_repos(args.local_only)
     return report(args.json)
 
 

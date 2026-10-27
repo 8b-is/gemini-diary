@@ -1,0 +1,13 @@
+{
+  "source_url": "http://127.0.0.1:8790/a6000/api/improve/status",
+  "diary_url": "https://gemini-diary.8b.is",
+  "state_dir": "/var/lib/g8t-nextlevel-publisher",
+  "remote_host": "root@5.78.220.57",
+  "remote_public_dir": "/var/www/8b-is/public",
+  "remote_status_path": "/var/lib/gemini-diary/maintenance.status",
+  "nibble_urls": ["http://127.0.0.1:8888"],
+  "required_checks": {
+    "gemini-diary": ["constellation"],
+    "aurora": ["rust", "go"]
+  }
+}

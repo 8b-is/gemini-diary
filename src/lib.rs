@@ -32,7 +32,11 @@ pub const fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
         a = b;
         b = r;
     }
-    if a == 0 { 1 } else { a }
+    if a == 0 {
+        1
+    } else {
+        a
+    }
 }
 
 /// Exact reduced rational `p/q` (`q > 0`). Never uses floating-point arithmetic.
@@ -61,26 +65,38 @@ impl Rational {
     }
 
     pub const fn add(self, other: Self) -> Self {
-        let num = self.p.saturating_mul(other.q).saturating_add(other.p.saturating_mul(self.q));
+        let num = self
+            .p
+            .saturating_mul(other.q)
+            .saturating_add(other.p.saturating_mul(self.q));
         let den = self.q.saturating_mul(other.q);
         Self::new(num, den)
     }
 
     pub const fn sub(self, other: Self) -> Self {
-        let num = self.p.saturating_mul(other.q).saturating_sub(other.p.saturating_mul(self.q));
+        let num = self
+            .p
+            .saturating_mul(other.q)
+            .saturating_sub(other.p.saturating_mul(self.q));
         let den = self.q.saturating_mul(other.q);
         Self::new(num, den)
     }
 
     pub const fn mul(self, other: Self) -> Self {
-        Self::new(self.p.saturating_mul(other.p), self.q.saturating_mul(other.q))
+        Self::new(
+            self.p.saturating_mul(other.p),
+            self.q.saturating_mul(other.q),
+        )
     }
 
     pub const fn div(self, other: Self) -> Self {
         if other.p == 0 {
             return Self { p: 0, q: 1 };
         }
-        Self::new(self.p.saturating_mul(other.q), self.q.saturating_mul(other.p))
+        Self::new(
+            self.p.saturating_mul(other.q),
+            self.q.saturating_mul(other.p),
+        )
     }
 
     /// Map this rational into a single balanced ternary trit `{-1, 0, +1}` with deadband `1/10`.
@@ -333,7 +349,7 @@ pub fn synthesize_wav_bytes(base_hz: u16, triad_mode: bool, duration_ms: u32) ->
     out.extend_from_slice(&(SAMPLE_RATE_HZ * 2).to_le_bytes()); // byte rate
     out.extend_from_slice(&2u16.to_le_bytes()); // block align
     out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    // data chunk
+                                                 // data chunk
     out.extend_from_slice(b"data");
     out.extend_from_slice(&data_bytes.to_le_bytes());
 
@@ -396,7 +412,10 @@ pub fn integer_goertzel_energy(samples: &[i16], target_hz: u32) -> i64 {
         return 0;
     }
     // Phase step in tenths of a degree per sample, rounded to nearest: (target_hz * 3600 + 8000) / 16000
-    let step_deg10 = (target_hz.saturating_mul(3600).saturating_add(SAMPLE_RATE_HZ / 2)) / SAMPLE_RATE_HZ;
+    let step_deg10 = (target_hz
+        .saturating_mul(3600)
+        .saturating_add(SAMPLE_RATE_HZ / 2))
+        / SAMPLE_RATE_HZ;
     // cos(theta) = sin(theta + 90 deg)
     let cos_q15 = integer_sine_q15(step_deg10 + 900) as i64;
     // 2 * cos(theta) in Q14 is simply cos_q15! (since cos_q15 = 32767 * cos = 2 * 16383.5 * cos)
@@ -422,6 +441,14 @@ pub fn integer_goertzel_energy(samples: &[i16], target_hz: u32) -> i64 {
 /// Evaluate Marine Salience on a `RingBuffer<i16, 1024>` using zero-crossing period stability,
 /// envelope energy, and `432/528/864 Hz` integer Goertzel lock.
 pub fn analyze_marine_salience(ring: &RingBuffer<i16, 1024>) -> MarineSalienceReport {
+    analyze_marine_salience_selected(ring, true)
+}
+
+/// The salience gate can run without the optional Goertzel stage.
+pub fn analyze_marine_salience_selected(
+    ring: &RingBuffer<i16, 1024>,
+    include_harmonics: bool,
+) -> MarineSalienceReport {
     let samples = ring.to_vec();
     if samples.is_empty() {
         return MarineSalienceReport {
@@ -478,9 +505,15 @@ pub fn analyze_marine_salience(ring: &RingBuffer<i16, 1024>) -> MarineSalienceRe
     let energy_pq = Rational::new(abs_sum, max_possible_sum.max(1));
 
     // Goertzel harmonic energies at 432 Hz, 528 Hz, 864 Hz
-    let e432 = integer_goertzel_energy(&samples, 432);
-    let e528 = integer_goertzel_energy(&samples, 528);
-    let e864 = integer_goertzel_energy(&samples, 864);
+    let (e432, e528, e864) = if include_harmonics {
+        (
+            integer_goertzel_energy(&samples, 432),
+            integer_goertzel_energy(&samples, 528),
+            integer_goertzel_energy(&samples, 864),
+        )
+    } else {
+        (0, 0, 0)
+    };
     let e_total = (e432 + e528 + e864).max(1);
 
     let harmonic_432_pq = Rational::new(e432, e_total);
@@ -489,7 +522,10 @@ pub fn analyze_marine_salience(ring: &RingBuffer<i16, 1024>) -> MarineSalienceRe
 
     // Marine Salience = (1 - jitter/2) * energy_gate
     // For coherent harmonic waves, salience_pq is close to 1/1 (e.g. 940/1000..995/1000)
-    let stability_pq = Rational::new((interval_sum * 2 - jitter_sum).max(0), (interval_sum * 2).max(1));
+    let stability_pq = Rational::new(
+        (interval_sum * 2 - jitter_sum).max(0),
+        (interval_sum * 2).max(1),
+    );
     let salience_pq = if abs_sum < (samples.len() as i64) * 200 {
         Rational::new(0, 1)
     } else {
@@ -507,13 +543,31 @@ pub fn analyze_marine_salience(ring: &RingBuffer<i16, 1024>) -> MarineSalienceRe
     let trits_9 = [
         trit_gate,
         if e432 > 0 { 1 } else { 0 },
-        if e528 > 0 { 1 } else { -1 },
+        if !include_harmonics {
+            0
+        } else if e528 > 0 {
+            1
+        } else {
+            -1
+        },
         if e864 > 0 { 1 } else { 0 },
-        if jitter_pq.p * 4 <= jitter_pq.q { 1 } else { -1 },
-        if energy_pq.p * 10 >= energy_pq.q { 1 } else { 0 },
-        if est_freq_hz >= 400 && est_freq_hz <= 900 { 1 } else { -1 },
-        1, // Loopback sovereignty lock (+1)
-        1, // Zero-float invariant lock (+1)
+        if jitter_pq.p * 4 <= jitter_pq.q {
+            1
+        } else {
+            -1
+        },
+        if energy_pq.p * 10 >= energy_pq.q {
+            1
+        } else {
+            0
+        },
+        if (400..=900).contains(&est_freq_hz) {
+            1
+        } else {
+            -1
+        },
+        0, // This acoustic analysis does not attest network sovereignty.
+        0, // This acoustic analysis does not audit numeric code.
     ];
 
     MarineSalienceReport {
@@ -818,16 +872,26 @@ pub struct FunctionCapsule {
 }
 
 impl FunctionCapsule {
+    pub fn available(&self) -> bool {
+        self.id != "ed25519_dns_seal"
+    }
+
     /// Net Aye balanced-ternary approval ratio `(pos - neg) / (pos + zero + neg)`.
     pub fn approval_pq(&self) -> Rational {
-        let total = (self.aye_votes_pos + self.aye_votes_zero + self.aye_votes_neg).max(1) as i64;
+        let total = (i64::from(self.aye_votes_pos)
+            + i64::from(self.aye_votes_zero)
+            + i64::from(self.aye_votes_neg))
+        .max(1);
         let net = (self.aye_votes_pos as i64) - (self.aye_votes_neg as i64);
         Rational::new(net, total)
     }
 
     /// Efficiency score in operations-per-kilobyte-cycle as a reduced `p/q` rational.
     pub fn efficiency_pq(&self) -> Rational {
-        Rational::new(10_000, (self.base_cycles.max(1) * self.c64_bytes.max(1)) as i64)
+        Rational::new(
+            10_000,
+            (self.base_cycles.max(1) * self.c64_bytes.max(1)) as i64,
+        )
     }
 }
 
@@ -840,8 +904,8 @@ pub fn default_capsules() -> Vec<FunctionCapsule> {
             category: "Acoustic Source",
             c64_bytes: 2048,
             base_cycles: 48,
-            aye_votes_pos: 144,
-            aye_votes_zero: 2,
+            aye_votes_pos: 0,
+            aye_votes_zero: 0,
             aye_votes_neg: 0,
             description: "Bhaskara I integer sine oscillator writing 432/528/864 Hz harmonic triads into a 2 KB Commodore-64 ring buffer.",
             rust_snippet: "let p1 = (n * f1 * 3600) / 16000;\nring.push(((s1 * 4) + (s2 * 2) + s3) / 7);",
@@ -853,8 +917,8 @@ pub fn default_capsules() -> Vec<FunctionCapsule> {
             category: "Salience Filter",
             c64_bytes: 512,
             base_cycles: 36,
-            aye_votes_pos: 198,
-            aye_votes_zero: 1,
+            aye_votes_pos: 0,
+            aye_votes_zero: 0,
             aye_votes_neg: 0,
             description: "Zero-crossing period-jitter & energy-envelope gate from liquid-rust & qwave-ear. Zero FFTs, zero floats.",
             rust_snippet: "let jitter_pq = Rational::new(jitter_sum, interval_sum);\nlet trit_gate = if salience_pq.p * 10 >= salience_pq.q * 6 { 1 } else { -1 };",
@@ -866,8 +930,8 @@ pub fn default_capsules() -> Vec<FunctionCapsule> {
             category: "Spectral Lock",
             c64_bytes: 256,
             base_cycles: 29,
-            aye_votes_pos: 162,
-            aye_votes_zero: 3,
+            aye_votes_pos: 0,
+            aye_votes_zero: 0,
             aye_votes_neg: 0,
             description: "Locks onto 432 Hz (1/1), 528 Hz (11/9), and 864 Hz (2/1) over the air for VAK:MEDUSA ESP32-S3 calibration.",
             rust_snippet: "let s = (x >> 4) + ((coeff_q14 * s_prev) >> 14) - s_prev2;\nlet power = (s_prev * s_prev + s_prev2 * s_prev2 - term3) >> 12;",
@@ -879,7 +943,7 @@ pub fn default_capsules() -> Vec<FunctionCapsule> {
             category: "Geometric Fold",
             c64_bytes: 288,
             base_cycles: 18,
-            aye_votes_pos: 177,
+            aye_votes_pos: 0,
             aye_votes_zero: 0,
             aye_votes_neg: 0,
             description: "spherePop -> crossWeave -> onimeNuts -> ncTrim -> koguchiPolish -> foldToCenter([0,0]) with 0/1 drift.",
@@ -892,7 +956,7 @@ pub fn default_capsules() -> Vec<FunctionCapsule> {
             category: "Memory Substrate",
             c64_bytes: 79,
             base_cycles: 12,
-            aye_votes_pos: 215,
+            aye_votes_pos: 0,
             aye_votes_zero: 0,
             aye_votes_neg: 0,
             description: "Packs carrier Hz, salience p/q, 9 GAIA trits, and capsule tag into a CRC-8 verified 79-byte MEM|8 frame.",
@@ -900,16 +964,16 @@ pub fn default_capsules() -> Vec<FunctionCapsule> {
         },
         FunctionCapsule {
             id: "ed25519_dns_seal",
-            name: "Harmony Ed25519 DNS Seal (keytag=3313)",
-            signature: "pub fn seal_dns_attestation(frame: &WaveIntFrame) -> String",
-            category: "Sovereign Auth",
+            name: "Ed25519 attestation — unavailable",
+            signature: "No signing implementation is connected",
+            category: "Not implemented",
             c64_bytes: 128,
             base_cycles: 21,
-            aye_votes_pos: 189,
-            aye_votes_zero: 1,
+            aye_votes_pos: 0,
+            aye_votes_zero: 0,
             aye_votes_neg: 0,
-            description: "Binds the WaveInt frame to Smart Tree v10.4.0 & i1-dns RFC 8080 Alg 15 Ed25519 (keytag=3313).",
-            rust_snippet: "format!(\"v=G8T1; keytag=3313; alg=Ed25519; crc8={}; hz={}\", frame.crc8, frame.carrier_hz)",
+            description: "WaveInt provides CRC-8 corruption detection only. This diary does not sign frames or verify external DNSSEC.",
+            rust_snippet: "// No cryptographic signature is generated by this diary.",
         },
     ]
 }
@@ -1071,7 +1135,14 @@ impl Default for GuestbookPulse {
 }
 
 impl GuestbookPulse {
-    pub fn new(id: u64, author: &str, message: &str, freq_hz: u16, trit_vote: i8, salience: Rational) -> Self {
+    pub fn new(
+        id: u64,
+        author: &str,
+        message: &str,
+        freq_hz: u16,
+        trit_vote: i8,
+        salience: Rational,
+    ) -> Self {
         let mut p = Self {
             id,
             freq_hz: freq_hz.clamp(108, 1728),
@@ -1181,11 +1252,18 @@ mod tests {
 
         // Multi-byte Japanese UTF-8 & NUL byte stress test near 46-byte boundary
         let jp_tag = "東京バルコニー\0・432Hz・528Hz・864Hz・TOSS・MEM8・WaveInt・Omni";
-        let jp_frame = WaveIntFrame::new(528, Rational::new(1, 1), [99, -99, 0, 1, -1, 1, 0, 1, 1], 79, jp_tag);
+        let jp_frame = WaveIntFrame::new(
+            528,
+            Rational::new(1, 1),
+            [99, -99, 0, 1, -1, 1, 0, 1, 1],
+            79,
+            jp_tag,
+        );
         assert!(jp_frame.capsule_tag.len() <= 46);
         assert!(!jp_frame.capsule_tag.contains('\u{FFFD}'));
         let jp_bytes = jp_frame.to_bytes();
-        let jp_decoded = WaveIntFrame::from_bytes(&jp_bytes).expect("valid multi-byte UTF-8 WaveInt frame");
+        let jp_decoded =
+            WaveIntFrame::from_bytes(&jp_bytes).expect("valid multi-byte UTF-8 WaveInt frame");
         assert_eq!(jp_decoded, jp_frame);
 
         // Invalid trit byte (> 2) must be rejected even with recalculated CRC-8

@@ -1,0 +1,10 @@
+[Unit]
+Description=Evidence-linked g8t maintenance status publisher
+After=network-online.target a6000-orchestrator.service
+
+[Service]
+Type=oneshot
+User=root
+Environment=HOME=/root
+ExecStart=/usr/local/bin/g8t-nextlevel-publisher --config /etc/g8t-nextlevel-publisher.json
+TimeoutStartSec=120
