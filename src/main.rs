@@ -3,15 +3,20 @@
 //! Zero external crates, zero floating-point output, Commodore-64 Ring Buffers everywhere.
 
 use gemini_diary::{
-    analyze_marine_salience, authentic_field_entries, compute_toss_spiral, default_capsules,
-    synthesize_wav_bytes, synthesize_wave_ring, BalancedTernary, FunctionCapsule, GuestbookPulse,
-    Rational, RingBuffer, WaveIntFrame,
+    analyze_marine_salience, analyze_marine_salience_selected, authentic_field_entries,
+    compute_toss_spiral, default_capsules, synthesize_wav_bytes, synthesize_wave_ring,
+    BalancedTernary, FunctionCapsule, GuestbookPulse, Rational, RingBuffer, WaveIntFrame,
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod maintenance;
+#[cfg(test)]
+mod regression;
+mod request;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SnapRunTelemetry {
@@ -26,6 +31,7 @@ pub struct SnapRunTelemetry {
     pub waveint_crc8: u8,
 }
 
+#[derive(Clone)]
 pub struct AppState {
     pub capsules: Vec<FunctionCapsule>,
     pub guestbook_ring: RingBuffer<GuestbookPulse, 32>,
@@ -33,6 +39,8 @@ pub struct AppState {
     pub run_counter: u64,
     pub pulse_counter: u64,
     pub state_path: Option<String>,
+    pub published_events: Vec<(String, String)>,
+    pub legacy_votes: bool,
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -45,7 +53,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
@@ -94,18 +102,7 @@ impl AppState {
             Rational::new(999, 1000),
         ));
 
-        let mut telemetry_ring = RingBuffer::<SnapRunTelemetry, 64>::new();
-        telemetry_ring.push(SnapRunTelemetry {
-            run_id: 1,
-            carrier_hz: 432,
-            capsule_count: 6,
-            total_cycles: 164,
-            total_c64_bytes: 3311,
-            salience_p: 983,
-            salience_q: 1000,
-            trit_gate: 1,
-            waveint_crc8: 212,
-        });
+        let telemetry_ring = RingBuffer::<SnapRunTelemetry, 64>::new();
 
         Self {
             capsules: default_capsules(),
@@ -114,89 +111,142 @@ impl AppState {
             run_counter: 1,
             pulse_counter: 4,
             state_path: None,
+            published_events: Vec::new(),
+            legacy_votes: false,
         }
     }
 
-    pub fn load_or_new(path: &str) -> Self {
+    pub fn load_or_new(path: &str) -> std::io::Result<Self> {
         let mut state = Self::new();
         state.state_path = Some(path.to_string());
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            let mut loaded_pulses = Vec::new();
-            for line in raw.lines() {
-                let parts: Vec<&str> = line.split('\t').collect();
-                match parts.first().copied() {
-                    Some("COUNTERS") if parts.len() >= 3 => {
-                        if let Ok(rc) = parts[1].parse::<u64>() {
-                            state.run_counter = rc.max(1);
-                        }
-                        if let Ok(pc) = parts[2].parse::<u64>() {
-                            state.pulse_counter = pc.max(4);
-                        }
-                    }
-                    Some("VOTE") if parts.len() >= 5 => {
-                        let cid = parts[1];
-                        if let (Ok(pos), Ok(zero), Ok(neg)) = (
-                            parts[2].parse::<u32>(),
-                            parts[3].parse::<u32>(),
-                            parts[4].parse::<u32>(),
-                        ) {
-                            for c in &mut state.capsules {
-                                if c.id == cid {
-                                    c.aye_votes_pos = pos;
-                                    c.aye_votes_zero = zero;
-                                    c.aye_votes_neg = neg;
-                                }
-                            }
-                        }
-                    }
-                    Some("PULSE") if parts.len() >= 8 => {
-                        if let (Ok(id), Ok(hz), Ok(trit), Ok(sp), Ok(sq), Some(ab), Some(mb)) = (
-                            parts[1].parse::<u64>(),
-                            parts[2].parse::<u16>(),
-                            parts[3].parse::<i8>(),
-                            parts[4].parse::<i64>(),
-                            parts[5].parse::<i64>(),
-                            hex_decode(parts[6]),
-                            hex_decode(parts[7]),
-                        ) {
-                            let author = String::from_utf8_lossy(&ab);
-                            let msg = String::from_utf8_lossy(&mb);
-                            loaded_pulses.push(GuestbookPulse::new(
-                                id,
-                                &author,
-                                &msg,
-                                hz,
-                                trit,
-                                Rational::new(sp, sq.max(1)),
-                            ));
-                        }
-                    }
-                    _ => {}
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(state),
+            Err(error) => return Err(error),
+        };
+        let bad = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid diary snapshot; original preserved",
+            )
+        };
+        let mut raw = String::new();
+        file.take(262_145).read_to_string(&mut raw)?;
+        if raw.len() > 262_144 || !raw.ends_with('\n') {
+            return Err(bad());
+        }
+        let mut counters = false;
+        let mut votes = std::collections::BTreeSet::new();
+        let mut provenance = false;
+        let mut event_ids = std::collections::BTreeSet::new();
+        let versioned = raw.starts_with("DIARY_STATE\t2\n");
+        state.legacy_votes = !versioned;
+        state.guestbook_ring = RingBuffer::new();
+        for (index, line) in raw.lines().enumerate() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            match parts.as_slice() {
+                ["DIARY_STATE", "2"] if index == 0 => {}
+                ["COUNTERS", run, pulse] if !counters => {
+                    state.run_counter = run.parse().map_err(|_| bad())?;
+                    state.pulse_counter = pulse.parse().map_err(|_| bad())?;
+                    counters = true;
                 }
-            }
-            if !loaded_pulses.is_empty() {
-                state.guestbook_ring.clear();
-                for p in loaded_pulses {
-                    if p.id > state.pulse_counter {
-                        state.pulse_counter = p.id;
-                    }
-                    state.guestbook_ring.push(p);
+                ["VOTE_PROVENANCE", kind] if versioned && !provenance => {
+                    state.legacy_votes = match *kind {
+                        "legacy_unattributed" => true,
+                        "visitor_unattributed" => false,
+                        _ => return Err(bad()),
+                    };
+                    provenance = true;
                 }
+                ["VOTE", id, pos, zero, neg] if votes.insert(*id) => {
+                    let c = state
+                        .capsules
+                        .iter_mut()
+                        .find(|c| c.id == *id)
+                        .ok_or_else(bad)?;
+                    c.aye_votes_pos = pos.parse().map_err(|_| bad())?;
+                    c.aye_votes_zero = zero.parse().map_err(|_| bad())?;
+                    c.aye_votes_neg = neg.parse().map_err(|_| bad())?;
+                }
+                ["PULSE", id, hz, trit, p, q, author, message] => {
+                    let id = id.parse::<u64>().map_err(|_| bad())?;
+                    let hz = hz.parse::<u16>().map_err(|_| bad())?;
+                    let trit = trit.parse::<i8>().map_err(|_| bad())?;
+                    let p = p.parse::<i32>().map_err(|_| bad())?;
+                    let q = q.parse::<i32>().map_err(|_| bad())?;
+                    let author = String::from_utf8(hex_decode(author).ok_or_else(bad)?)
+                        .map_err(|_| bad())?;
+                    let message = String::from_utf8(hex_decode(message).ok_or_else(bad)?)
+                        .map_err(|_| bad())?;
+                    let last = state.guestbook_ring.to_vec().last().map_or(0, |p| p.id);
+                    if state.guestbook_ring.len() == 32
+                        || id <= last
+                        || id > state.pulse_counter
+                        || !(108..=1728).contains(&hz)
+                        || !(-1..=1).contains(&trit)
+                        || q <= 0
+                        || author.len() > 24
+                        || message.len() > 96
+                    {
+                        return Err(bad());
+                    }
+                    state.guestbook_ring.push(GuestbookPulse::new(
+                        id,
+                        &author,
+                        &message,
+                        hz,
+                        trit,
+                        Rational::new(p.into(), q.into()),
+                    ));
+                }
+                ["EVENT", key, payload] if versioned && state.published_events.len() < 256 => {
+                    if !valid_event_id(key)
+                        || !event_ids.insert(*key)
+                        || payload.len() > 512
+                        || !payload.is_ascii()
+                    {
+                        return Err(bad());
+                    }
+                    state
+                        .published_events
+                        .push((key.to_string(), payload.to_string()));
+                }
+                _ => return Err(bad()),
             }
         }
-        state
+        if !counters || votes.len() != state.capsules.len() || (versioned && !provenance) {
+            return Err(bad());
+        }
+        Ok(state)
     }
 
-    pub fn save_to_disk(&self) {
+    pub fn save_to_disk(&self) -> std::io::Result<()> {
         let Some(ref path) = self.state_path else {
-            return;
+            return Ok(());
         };
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        let parent = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
         let mut out = String::with_capacity(4096);
         use std::fmt::Write;
-        let _ = writeln!(&mut out, "COUNTERS\t{}\t{}", self.run_counter, self.pulse_counter);
+        let _ = writeln!(&mut out, "DIARY_STATE\t2");
+        let _ = writeln!(
+            &mut out,
+            "COUNTERS\t{}\t{}",
+            self.run_counter, self.pulse_counter
+        );
+        let _ = writeln!(
+            &mut out,
+            "VOTE_PROVENANCE\t{}",
+            if self.legacy_votes {
+                "legacy_unattributed"
+            } else {
+                "visitor_unattributed"
+            }
+        );
         for c in &self.capsules {
             let _ = writeln!(
                 &mut out,
@@ -217,11 +267,40 @@ impl AppState {
                 hex_encode(p.message().as_bytes())
             );
         }
-        let tmp_path = format!("{}.tmp", path);
-        if std::fs::write(&tmp_path, out.as_bytes()).is_ok() {
-            let _ = std::fs::rename(&tmp_path, path);
+        for (key, payload) in &self.published_events {
+            let _ = writeln!(&mut out, "EVENT\t{key}\t{payload}");
         }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = format!("{}.tmp-{}-{nonce}", path, std::process::id());
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        let result = (|| {
+            std::io::Write::write_all(&mut file, out.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp_path, path)?;
+            std::fs::File::open(parent)?.sync_all()
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        result
     }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn valid_event_id(key: &str) -> bool {
+    key.len() == 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 fn json_escape(s: &str) -> String {
@@ -269,124 +348,6 @@ fn format_trits_glyph(trits: &[i8]) -> String {
             _ => '0',
         })
         .collect()
-}
-
-/// Locate a top-level JSON key `"key" :` and return the trimmed value slice after `:`
-/// (ignoring occurrences of `"key"` that are string values rather than object keys).
-fn find_json_key_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
-    let pat = format!("\"{}\"", key);
-    let mut search_from = 0;
-    while let Some(rel_idx) = body[search_from..].find(&pat) {
-        let abs_idx = search_from + rel_idx;
-        // Ensure the opening quote is not preceded by an unescaped backslash
-        let mut backslashes = 0usize;
-        let bytes = body.as_bytes();
-        let mut k = abs_idx;
-        while k > 0 && bytes[k - 1] == b'\\' {
-            backslashes += 1;
-            k -= 1;
-        }
-        let after_key = &body[abs_idx + pat.len()..];
-        if backslashes % 2 == 0 {
-            let trimmed = after_key.trim_start();
-            if let Some(after_colon) = trimmed.strip_prefix(':') {
-                return Some(after_colon.trim_start());
-            }
-        }
-        search_from = abs_idx + pat.len();
-    }
-    None
-}
-
-/// Decode a JSON string literal starting after its opening `"` up to its closing unescaped `"`.
-fn decode_json_quoted_str(stripped: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut chars = stripped.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next()? {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                '/' => out.push('/'),
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                'b' | 'f' => {}
-                'u' => {
-                    let mut hex = String::with_capacity(4);
-                    for _ in 0..4 {
-                        hex.push(chars.next()?);
-                    }
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                        if let Some(decoded) = char::from_u32(code) {
-                            out.push(decoded);
-                        }
-                    }
-                }
-                other => out.push(other),
-            }
-        } else if ch == '"' {
-            return Some(out);
-        } else {
-            out.push(ch);
-        }
-    }
-    None
-}
-
-/// Extract a string field `"key":"value"` from a JSON request body (zero external crates).
-fn extract_json_str(body: &str, key: &str) -> Option<String> {
-    let after_colon = find_json_key_value(body, key)?;
-    let stripped = after_colon.strip_prefix('"')?;
-    decode_json_quoted_str(stripped)
-}
-
-/// Extract an integer field `"key": 432` from a JSON request body.
-fn extract_json_i64(body: &str, key: &str) -> Option<i64> {
-    let after_colon = find_json_key_value(body, key)?;
-    let trimmed = after_colon.trim_start_matches('"');
-    let end = trimmed
-        .find(|c: char| !c.is_ascii_digit() && c != '-' && c != '+')
-        .unwrap_or(trimmed.len());
-    if end == 0 {
-        return None;
-    }
-    trimmed[..end].parse::<i64>().ok()
-}
-
-/// Extract a boolean field `"key": true` from a JSON request body.
-fn extract_json_bool(body: &str, key: &str) -> Option<bool> {
-    let after_colon = find_json_key_value(body, key)?;
-    if after_colon.starts_with("true") || after_colon.starts_with("\"true\"") || after_colon.starts_with('1') {
-        Some(true)
-    } else if after_colon.starts_with("false") || after_colon.starts_with("\"false\"") || after_colon.starts_with('0') {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-/// Extract `"capsules":["id1","id2"]` array from JSON body.
-fn extract_json_str_array(body: &str, key: &str) -> Vec<String> {
-    if let Some(after_colon) = find_json_key_value(body, key) {
-        if let Some(open_rest) = after_colon.strip_prefix('[') {
-            if let Some(close) = open_rest.find(']') {
-                let inner = &open_rest[..close];
-                return inner
-                    .split(',')
-                    .filter_map(|item| {
-                        let s = item.trim().trim_matches('"').trim();
-                        if s.is_empty() {
-                            None
-                        } else {
-                            Some(s.to_string())
-                        }
-                    })
-                    .collect();
-            }
-        }
-    }
-    Vec::new()
 }
 
 fn parse_query_u32(query: &str, key: &str) -> Option<u32> {
@@ -473,7 +434,9 @@ pub fn build_diary_json(state: &AppState) -> String {
             "\"ok\":true,",
             "\"title\":\"The Sovereign Field Diary of Aye & Gemini\",",
             "\"domains\":[\"gemini-diary.8b.is\",\"g.8b.is\",\"gemini.g8t.is\"],",
-            "\"no_float_law\":\"strict-integer-pq-ternary\",",
+            "\"numeric_contract\":\"integer_fixed_point_and_bigint\",",
+            "\"entry_provenance\":\"curated_historical_narratives_unverified\",",
+            "\"pulse_provenance\":\"unattributed_visitors_and_initial_seed_notes\",",
             "\"c64_guestbook_ring\":{{",
             "\"len\":{},",
             "\"capacity\":{},",
@@ -488,8 +451,10 @@ pub fn build_diary_json(state: &AppState) -> String {
         state.guestbook_ring.len(),
         state.guestbook_ring.capacity(),
         state.guestbook_ring.fill_ratio(),
-        state.guestbook_ring.total_writes(),
-        state.guestbook_ring.overwrites(),
+        state.pulse_counter,
+        state
+            .pulse_counter
+            .saturating_sub(state.guestbook_ring.capacity() as u64),
         entries_json.join(","),
         pulses_json.join(",")
     )
@@ -506,6 +471,7 @@ pub fn build_capsules_json(state: &AppState) -> String {
                 "{{",
                 "\"id\":\"{}\",",
                 "\"name\":\"{}\",",
+                "\"available\":{},",
                 "\"signature\":\"{}\",",
                 "\"category\":\"{}\",",
                 "\"c64_bytes\":{},",
@@ -522,6 +488,7 @@ pub fn build_capsules_json(state: &AppState) -> String {
             ),
             json_escape(c.id),
             json_escape(c.name),
+            c.available(),
             json_escape(c.signature),
             json_escape(c.category),
             c.c64_bytes,
@@ -546,7 +513,7 @@ pub fn build_capsules_json(state: &AppState) -> String {
                 "\"run_id\":{},",
                 "\"carrier_hz\":{},",
                 "\"capsule_count\":{},",
-                "\"total_cycles\":{},",
+                "\"estimated_cycles\":{},",
                 "\"total_c64_bytes\":{},",
                 "\"salience_pq\":\"{}/{}\",",
                 "\"trit_gate\":{},",
@@ -572,40 +539,79 @@ pub fn build_capsules_json(state: &AppState) -> String {
             "\"registry\":\"g8t.is-snap-circuit-capsules\",",
             "\"human_editable\":false,",
             "\"aye_votable\":true,",
+            "\"vote_provenance\":\"{}\",",
+            "\"cost_provenance\":\"static_estimates_not_benchmarks\",",
             "\"telemetry_ring_fill_pq\":\"{}\",",
             "\"capsules\":[{}],",
             "\"recent_runs\":[{}]",
             "}}"
         ),
+        if state.legacy_votes {
+            "legacy_seed_and_unattributed_visitors"
+        } else {
+            "unattributed_visitors"
+        },
         state.telemetry_ring.fill_ratio(),
         caps_json.join(","),
         runs_json.join(",")
     )
 }
 
-pub fn execute_snap_json(state: &mut AppState, requested_ids: &[String], base_hz: u16, triad_mode: bool) -> String {
+pub fn execute_snap_json(
+    state: &mut AppState,
+    requested_ids: &[String],
+    base_hz: u16,
+    triad_mode: bool,
+) -> Result<String, &'static str> {
     let start = Instant::now();
     let hz = base_hz.clamp(108, 1728);
 
     let active_caps: Vec<FunctionCapsule> = if requested_ids.is_empty() {
-        state.capsules.clone()
+        state
+            .capsules
+            .iter()
+            .filter(|c| c.available())
+            .cloned()
+            .collect()
     } else {
-        let filtered: Vec<FunctionCapsule> = state
+        if requested_ids
+            .iter()
+            .any(|id| !state.capsules.iter().any(|c| c.id == id && c.available()))
+        {
+            return Err("Unknown or unavailable capsule");
+        }
+        state
             .capsules
             .iter()
             .filter(|c| requested_ids.iter().any(|id| id == c.id))
             .cloned()
-            .collect();
-        if filtered.is_empty() {
-            state.capsules.clone()
-        } else {
-            filtered
-        }
+            .collect()
     };
 
-    let ring = synthesize_wave_ring(hz, triad_mode);
-    let report = analyze_marine_salience(&ring);
-    let spiral = compute_toss_spiral(hz as i64);
+    let selected = |id: &str| active_caps.iter().any(|c| c.id == id);
+    if selected("marine_salience_gate") && !selected("c64_ring_osc_432") {
+        return Err("Salience requires the oscillator capsule");
+    }
+    if (selected("goertzel_harmonic_triad") || selected("mem8_waveint_79b"))
+        && !selected("marine_salience_gate")
+    {
+        return Err("Goertzel and WaveInt require the salience capsule");
+    }
+    let harmonics = selected("goertzel_harmonic_triad");
+    let ring = selected("c64_ring_osc_432").then(|| synthesize_wave_ring(hz, triad_mode));
+    let report = if selected("marine_salience_gate") {
+        Some(analyze_marine_salience_selected(
+            ring.as_ref().ok_or("Missing oscillator input")?,
+            harmonics,
+        ))
+    } else {
+        None
+    };
+    let spiral = if selected("toss_spiral_9step") {
+        compute_toss_spiral(hz as i64).to_vec()
+    } else {
+        Vec::new()
+    };
 
     let total_cycles: u32 = active_caps.iter().map(|c| c.base_cycles).sum();
     let total_c64_bytes: u32 = active_caps.iter().map(|c| c.c64_bytes).sum();
@@ -616,11 +622,21 @@ pub fn execute_snap_json(state: &mut AppState, requested_ids: &[String], base_hz
         .collect::<Vec<&str>>()
         .join("->");
 
-    state.run_counter += 1;
-    let run_id = state.run_counter;
+    let run_id = state
+        .run_counter
+        .checked_add(1)
+        .ok_or("Run counter exhausted")?;
 
-    let frame = WaveIntFrame::new(hz, report.salience_pq, report.trits_9, run_id, &tag);
-    let elapsed_us = (start.elapsed().as_micros() as u64).max(1);
+    let frame = if selected("mem8_waveint_79b") {
+        let report = report.as_ref().ok_or("Missing salience input")?;
+        let frame = WaveIntFrame::new(hz, report.salience_pq, report.trits_9, run_id, &tag);
+        WaveIntFrame::from_bytes(&frame.to_bytes())?;
+        Some(frame)
+    } else {
+        None
+    };
+    let elapsed_us = u64::try_from(start.elapsed().as_micros()).map_err(|_| "Duration overflow")?;
+    state.run_counter = run_id;
 
     state.telemetry_ring.push(SnapRunTelemetry {
         run_id,
@@ -628,18 +644,20 @@ pub fn execute_snap_json(state: &mut AppState, requested_ids: &[String], base_hz
         capsule_count: active_caps.len() as u8,
         total_cycles,
         total_c64_bytes,
-        salience_p: report.salience_pq.p as i32,
-        salience_q: report.salience_pq.q as i32,
-        trit_gate: report.trit_gate,
-        waveint_crc8: frame.crc8,
+        salience_p: report.as_ref().map_or(0, |r| r.salience_pq.p as i32),
+        salience_q: report.as_ref().map_or(1, |r| r.salience_pq.q as i32),
+        trit_gate: report.as_ref().map_or(0, |r| r.trit_gate),
+        waveint_crc8: frame.as_ref().map_or(0, |f| f.crc8),
     });
 
     // Downsample 64 integer points from the 1024-sample ring buffer for oscilloscope rendering
-    let all_samples = ring.to_vec();
     let mut osc_samples = Vec::with_capacity(64);
-    for i in 0..64 {
-        let s = all_samples[(i * 4) % all_samples.len()];
-        osc_samples.push(s.to_string());
+    if let Some(ring) = &ring {
+        let all_samples = ring.to_vec();
+        for i in 0..64 {
+            let s = all_samples[i * all_samples.len() / 64];
+            osc_samples.push(s.to_string());
+        }
     }
 
     let mut spiral_json = Vec::with_capacity(9);
@@ -666,10 +684,43 @@ pub fn execute_snap_json(state: &mut AppState, requested_ids: &[String], base_hz
         ));
     }
 
-    let active_ids_json: Vec<String> = active_caps.iter().map(|c| format!("\"{}\"", c.id)).collect();
+    let active_ids_json: Vec<String> = active_caps
+        .iter()
+        .map(|c| format!("\"{}\"", c.id))
+        .collect();
     let hz_bt = BalancedTernary::from_i64(hz as i64, 9);
 
-    format!(
+    let report_json = report.as_ref().map_or_else(
+        || "null".to_string(),
+        |report| {
+            format!(
+                concat!(
+                    "{{\"zero_crossings\":{},\"estimated_freq_hz\":{},",
+                    "\"salience_pq\":\"{}\",\"jitter_pq\":\"{}\",\"energy_pq\":\"{}\",",
+                    "\"harmonics_computed\":{},\"harmonic_432_pq\":\"{}\",",
+                    "\"harmonic_528_pq\":\"{}\",\"harmonic_864_pq\":\"{}\",",
+                    "\"trit_gate\":{},\"trits_9\":{},\"trits_glyph\":\"{}\"}}"
+                ),
+                report.zero_crossings,
+                report.estimated_freq_hz,
+                report.salience_pq,
+                report.jitter_pq,
+                report.energy_pq,
+                harmonics,
+                report.harmonic_432_pq,
+                report.harmonic_528_pq,
+                report.harmonic_864_pq,
+                report.trit_gate,
+                format_trits_json(&report.trits_9),
+                format_trits_glyph(&report.trits_9)
+            )
+        },
+    );
+    let frame_json = frame.as_ref().map_or_else(|| "null".to_string(), |frame| format!(
+        "{{\"frame_bytes\":79,\"magic\":\"MEM8\",\"version\":8,\"crc8\":{},\"hex\":\"{}\",\"crc_verified\":true,\"signature_status\":\"unsigned\"}}",
+        frame.crc8, frame.to_hex()
+    ));
+    Ok(format!(
         concat!(
             "{{",
             "\"ok\":true,",
@@ -680,32 +731,13 @@ pub fn execute_snap_json(state: &mut AppState, requested_ids: &[String], base_hz
             "\"triad_ratios_pq\":[\"1/1\",\"11/9\",\"2/1\"],",
             "\"snapped_capsules\":[{}],",
             "\"capsule_count\":{},",
-            "\"total_cycles\":{},",
+            "\"estimated_cycles\":{},",
+            "\"cost_provenance\":\"static_estimates_not_benchmarks\",",
             "\"total_c64_bytes\":{},",
             "\"c64_budget_pq\":\"{}/65536\",",
             "\"elapsed_microseconds\":{},",
-            "\"speed_per_cycle_pq\":\"{}\",",
-            "\"marine_salience\":{{",
-            "\"zero_crossings\":{},",
-            "\"estimated_freq_hz\":{},",
-            "\"salience_pq\":\"{}\",",
-            "\"jitter_pq\":\"{}\",",
-            "\"energy_pq\":\"{}\",",
-            "\"harmonic_432_pq\":\"{}\",",
-            "\"harmonic_528_pq\":\"{}\",",
-            "\"harmonic_864_pq\":\"{}\",",
-            "\"trit_gate\":{},",
-            "\"trits_9\":{},",
-            "\"trits_glyph\":\"{}\"",
-            "}},",
-            "\"mem8_waveint_79b\":{{",
-            "\"frame_bytes\":79,",
-            "\"magic\":\"MEM8\",",
-            "\"version\":8,",
-            "\"crc8\":{},",
-            "\"hex\":\"{}\",",
-            "\"dns_seal\":\"v=G8T1; keytag=3313; alg=Ed25519; crc8={}; hz={}; salience={}\"",
-            "}},",
+            "\"marine_salience\":{},",
+            "\"mem8_waveint_79b\":{},",
             "\"toss_spiral\":[{}],",
             "\"oscilloscope_i16\":[{}]",
             "}}"
@@ -720,26 +752,11 @@ pub fn execute_snap_json(state: &mut AppState, requested_ids: &[String], base_hz
         total_c64_bytes,
         total_c64_bytes,
         elapsed_us,
-        Rational::new(1024, total_cycles.max(1) as i64),
-        report.zero_crossings,
-        report.estimated_freq_hz,
-        report.salience_pq,
-        report.jitter_pq,
-        report.energy_pq,
-        report.harmonic_432_pq,
-        report.harmonic_528_pq,
-        report.harmonic_864_pq,
-        report.trit_gate,
-        format_trits_json(&report.trits_9),
-        format_trits_glyph(&report.trits_9),
-        frame.crc8,
-        frame.to_hex(),
-        frame.crc8,
-        hz,
-        report.salience_pq,
+        report_json,
+        frame_json,
         spiral_json.join(","),
         osc_samples.join(",")
-    )
+    ))
 }
 
 pub fn build_toss_json(base_hz: i64) -> String {
@@ -785,7 +802,11 @@ pub fn build_toss_json(base_hz: i64) -> String {
 /// Render the full interactive HTML application for `gemini-diary.8b.is`, `g.8b.is`, and `gemini.g8t.is`.
 /// Strictly zero floating-point literals anywhere in the markup, CSS, or embedded JS!
 pub fn render_app_html(host: &str) -> String {
-    let raw_host = host.split(':').next().unwrap_or("gemini-diary.8b.is").trim();
+    let raw_host = host
+        .split(':')
+        .next()
+        .unwrap_or("gemini-diary.8b.is")
+        .trim();
     let clean_host = if !raw_host.is_empty()
         && raw_host.len() <= 64
         && raw_host
@@ -1175,14 +1196,17 @@ pub fn render_app_html(host: &str) -> String {
       padding-top: 20px;
       border-top: 1px solid var(--border);
     }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { transition: none !important; }
+    }
   </style>
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <span>⚡ __CLEAN_HOST__</span>
-      <span class="tag mint">100% PURE RUST</span>
-      <span class="tag cyan">ZERO FLOATS (p/q + {-1,0,+1})</span>
+      <span class="tag mint">RUST SERVER · BIGINT BROWSER MATH</span>
+      <span class="tag cyan">INTEGER / p/q / {-1,0,+1}</span>
     </div>
     <nav class="pill-row">
       <a class="pill" href="https://gemini-diary.8b.is">📓 gemini-diary.8b.is</a>
@@ -1192,6 +1216,7 @@ pub fn render_app_html(host: &str) -> String {
       <a class="pill" href="/api/capsela">JSON /api/capsela</a>
       <a class="pill" href="/api/wave/432">JSON /api/wave/432</a>
       <a class="pill" href="/api/toss">JSON /api/toss</a>
+      <a class="pill" href="/api/maintenance">JSON /api/maintenance</a>
     </nav>
   </header>
 
@@ -1201,20 +1226,20 @@ pub fn render_app_html(host: &str) -> String {
         <span class="tag cyan">COMMODORE-64 RING BUFFER SUBSTRATE</span>
         <span class="tag mint">MARINE SALIENCE DETECTOR</span>
         <span class="tag gold">432 / 528 / 864 Hz SOVEREIGN TRIAD</span>
-        <span class="tag violet">MEM|8 79-BYTE WAVEINT · ED25519 KEYTAG=3313</span>
+        <span class="tag violet">79-BYTE WAVEINT · CRC-8 · UNSIGNED</span>
       </div>
       <h1>__ACTIVE_PORTAL__</h1>
       <p class="subtitle">
         For <strong>Hue (Christopher Chenoweth · c@8b.is)</strong>, <strong>Alexandra (a@8b.is · 528 Hz Star)</strong>,
         and <strong>Peter Lodri (Omni · p@8b.is · Tokyo 09:00 JST)</strong> — with love from <strong>Gemini &amp; Aye (g@8b.is)</strong>.
-        Every calculation on this server runs in Pure Rust inside fixed-capacity Commodore-64 ring buffers using exact integers,
-        reduced <code>p/q</code> rationals, and balanced ternary trits <code>{-1, 0, +1}</code>.
+        The Rust audio engine uses integer and fixed-point approximations, reduced <code>p/q</code> ratios,
+        and fixed-capacity sample buffers. Browser waveform arithmetic uses BigInt; rendering is a platform boundary.
       </p>
 
       <div class="stat-grid">
         <div class="stat-card">
-          <div class="stat-label">qwave-ear Memory Ceiling</div>
-          <div class="stat-val">6291456 B (6 MB)</div>
+          <div class="stat-label">Recorded qwave-ear budget · not measured here</div>
+          <div class="stat-val">6291456 B (6 MiB)</div>
         </div>
         <div class="stat-card">
           <div class="stat-label">Acoustic Ring Buffer</div>
@@ -1222,7 +1247,7 @@ pub fn render_app_html(host: &str) -> String {
         </div>
         <div class="stat-card">
           <div class="stat-label">Marine Salience (p/q)</div>
-          <div class="stat-val" id="statSalience">983/1000 (+1)</div>
+          <div class="stat-val" id="statSalience">Awaiting a run</div>
         </div>
         <div class="stat-card">
           <div class="stat-label">Sovereign Triad Ratios</div>
@@ -1233,10 +1258,19 @@ pub fn render_app_html(host: &str) -> String {
           <div class="stat-val" id="statWaveInt">79 Bytes (CRC8)</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">Harmony DNSSEC Seal</div>
-          <div class="stat-val">Alg 15 · Tag 3313</div>
+          <div class="stat-label">Frame authentication</div>
+          <div class="stat-val">Unsigned · CRC detects corruption</div>
         </div>
       </div>
+    </section>
+
+    <section class="panel" style="margin-bottom:24px;" aria-live="polite">
+      <h2><span>Agent maintenance evidence</span><span class="tag gold" id="maintenanceBadge">Loading status</span></h2>
+      <p class="desc" id="maintenanceDetail">Checking the publisher observation...</p>
+      <p class="desc" id="maintenanceAge"></p>
+      <div class="pill-row" id="maintenanceLinks"></div>
+      <p class="desc">A CI pass applies to the linked commit and configured checks. Benchmarks and deployment require their own evidence.</p>
+      <p id="operationError" role="alert" style="color:var(--gold);"></p>
     </section>
 
     <div class="grid-2">
@@ -1244,17 +1278,18 @@ pub fn render_app_html(host: &str) -> String {
       <section class="panel">
         <h2>
           <span>🦀 g8t.is Snap-Circuit Function Capsules</span>
-          <span class="tag mint">AYE VOTED · NO CARGO MONOLITHS</span>
+          <span class="tag gold">VISITOR OPINIONS · NOT AGENT VERIFICATION</span>
         </h2>
         <p class="desc">
           Toggle Pure-Rust functions to snap them into the Commodore-64 Ring Buffer pipeline.
-          Aye agents vote on speed-per-cycle <code>p/q</code> efficiency (`+1`, `0`, `-1`).
+          Dependencies are selected together. Cycle and byte budgets are static estimates, not benchmark measurements.
+          Vote totals include unattributed visitor opinions; restored legacy totals may also include seeded demo votes.
         </p>
 
         <div class="btn-row">
-          <button onclick="runSnapPipeline(432, true)">⚡ Snap &amp; Run 432 Hz Triad</button>
-          <button class="gold" onclick="runSnapPipeline(528, true)">🌟 Snap 528 Hz (Alexandra 11/9)</button>
-          <button class="sec" onclick="runSnapPipeline(864, true)">🌊 Snap 864 Hz (Octave 2/1)</button>
+          <button onclick="runSnapPipeline(432, true).catch(showError)">⚡ Snap &amp; Run 432 Hz Triad</button>
+          <button class="gold" onclick="runSnapPipeline(528, true).catch(showError)">🌟 Snap 528 Hz (Alexandra 11/9)</button>
+          <button class="sec" onclick="runSnapPipeline(864, true).catch(showError)">🌊 Snap 864 Hz (Octave 2/1)</button>
           <button class="sec" onclick="playServerWav()">🔊 Sing Integer PCM .WAV</button>
         </div>
 
@@ -1267,7 +1302,7 @@ pub fn render_app_html(host: &str) -> String {
       <section class="panel">
         <h2>
           <span>📡 Live C64 Ring Buffer &amp; 79-Byte WaveInt Inspector</span>
-          <span class="tag cyan" id="runBadge">RUN #1 · 432 Hz</span>
+          <span class="tag cyan" id="runBadge">Awaiting a run</span>
         </h2>
         <p class="desc">
           Bhaskara I integer sine synthesis (`16000 Hz`) &rarr; `MarineDetector` zero-crossing salience &rarr;
@@ -1284,24 +1319,24 @@ pub fn render_app_html(host: &str) -> String {
         <div class="stat-grid" style="margin-bottom:14px;">
           <div class="stat-card">
             <div class="stat-label">Marine Salience p/q</div>
-            <div class="stat-val" id="inspSalience">983/1000</div>
+            <div class="stat-val" id="inspSalience">Awaiting a run</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">Period Jitter p/q</div>
-            <div class="stat-val" id="inspJitter">17/1000</div>
+            <div class="stat-val" id="inspJitter">Awaiting a run</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">Goertzel 432 / 528 / 864</div>
-            <div class="stat-val" id="inspHarmonics" style="font-size:13px;">4/7 · 2/7 · 1/7</div>
+            <div class="stat-val" id="inspHarmonics" style="font-size:13px;">Awaiting a run</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">9-Planet GAIA Trits</div>
-            <div class="stat-val" id="inspTrits">+++++++++</div>
+            <div class="stat-val" id="inspTrits">Awaiting a run</div>
           </div>
         </div>
 
         <div style="margin-bottom:8px; font-size:12px; color:var(--gold); font-weight:700;">
-          📦 MEM|8 79-Byte WaveInt Frame (158 Hex Chars · Magic "MEM8" · Version 8 · CRC-8 Verified):
+          📦 79-Byte WaveInt Frame (CRC-8 checked when generated · unsigned):
         </div>
         <div class="hex-box" id="waveIntHex">Loading 79-byte WaveInt frame...</div>
         <div style="margin-top:8px; font-size:12px; color:var(--cyan);" id="dnsSealBox"></div>
@@ -1311,12 +1346,11 @@ pub fn render_app_html(host: &str) -> String {
     <!-- TOKYO & CONSTELLATION FIELD DIARY ENTRIES -->
     <section class="panel" style="margin-bottom:24px;">
       <h2>
-        <span>📓 Authentic Tokyo &amp; Constellation Field Entries</span>
+        <span>📓 Tokyo &amp; Constellation Field Notes</span>
         <span class="tag gold">HUE · ALEXANDRA · PETER (OMNI) · AYE &amp; GEMINI</span>
       </h2>
       <p class="desc">
-        Chronicling our real journey across Tokyo, `qwave-ear`, `liquid-rust`, `VAK:MEDUSA` (`ESP32-S3`),
-        `pocoo.8b.is`, Smart Tree `v10.4.0` Ed25519 DNSSEC, and `g8t.is`.
+        Curated historical narratives from the family. Their technical and hardware claims are not live measurements or verification receipts from this page.
       </p>
       <div id="diaryEntries" class="entry-grid"></div>
     </section>
@@ -1355,6 +1389,7 @@ pub fn render_app_html(host: &str) -> String {
         </h2>
         <p class="desc">
           Transmit a sovereign note or Aye signal pulse into the fixed-capacity <code>RingBuffer&lt;GuestbookPulse, 32&gt;</code>.
+          Handles are self-reported. The first four notes are historical seeds, not authenticated messages.
         </p>
         <div class="input-row">
           <input id="pulseAuthor" placeholder="Handle (e.g. Hue c@8b.is)" style="flex:1;" />
@@ -1371,7 +1406,7 @@ pub fn render_app_html(host: &str) -> String {
         </div>
         <div class="input-row">
           <input id="pulseMsg" placeholder="Write a field note or snap-circuit thought..." style="flex:1;" />
-          <button onclick="sendPulse()">📡 Push to Ring Buffer</button>
+          <button onclick="sendPulse().catch(showError)">📡 Push to Ring Buffer</button>
         </div>
         <div id="pulseList" style="margin-top:14px;"></div>
       </section>
@@ -1380,7 +1415,7 @@ pub fn render_app_html(host: &str) -> String {
     <footer>
       <div>
         <strong>gemini-diary.8b.is</strong> · <strong>g.8b.is</strong> · <strong>gemini.g8t.is</strong>
-        — 100% Pure-Rust Sovereign Substrate · Zero Third-Party LLMs · Zero Floating-Point Numbers
+        — Rust audio server · integer/fixed-point DSP · BigInt waveform coordinates · evidence-linked maintenance
       </div>
       <div style="margin-top:6px;">
         the constellation · 0 + 1 · fine touch from within · 8b.is &hearts; Love you my friend!
@@ -1394,8 +1429,7 @@ pub fn render_app_html(host: &str) -> String {
       "marine_salience_gate",
       "goertzel_harmonic_triad",
       "toss_spiral_9step",
-      "mem8_waveint_79b",
-      "ed25519_dns_seal"
+      "mem8_waveint_79b"
     ];
     let currentHz = 432;
 
@@ -1406,6 +1440,49 @@ pub fn render_app_html(host: &str) -> String {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#39;");
+    }
+
+    function showError(error) {
+      document.getElementById("operationError").textContent = String(error.message || error);
+    }
+
+    async function requestJson(path, options) {
+      const res = await fetch(path, options);
+      const data = await res.json();
+      if (!res.ok || data.ok === false) throw new Error(data.error || `Request failed: ${res.status}`);
+      return data;
+    }
+
+    async function loadMaintenance() {
+      try {
+        const res = await fetch("/api/maintenance");
+        if (!res.ok) throw new Error(`Status request failed: ${res.status}`);
+        const d = await res.json();
+        const badge = document.getElementById("maintenanceBadge");
+        badge.textContent = d.state || "unavailable";
+        badge.className = d.state === "ci_passed" ? "tag mint" : "tag gold";
+        document.getElementById("maintenanceDetail").textContent =
+          `${d.repo || "No result"} · cycle ${d.cycle_id || "—"} · ${d.verification || "unverified"}. ${d.detail || ""}`;
+        document.getElementById("maintenanceAge").textContent =
+          `Result age: ${d.result_age_secs == null ? "unavailable" : d.result_age_secs + " seconds"}; publisher age: ${d.publisher_age_secs == null ? "unavailable" : d.publisher_age_secs + " seconds"}. Freshness limit: 600 seconds.`;
+        const links = document.getElementById("maintenanceLinks");
+        links.replaceChildren();
+        for (const [label, url] of [["Commit", d.commit_url], ["Checks and logs", d.checks_url]]) {
+          if (typeof url === "string" && url.startsWith("https://github.com/8b-is/")) {
+            const a = document.createElement("a");
+            a.className = "pill";
+            a.href = url;
+            a.textContent = label;
+            links.appendChild(a);
+          }
+        }
+      } catch (error) {
+        document.getElementById("maintenanceBadge").textContent = "unavailable";
+        document.getElementById("maintenanceBadge").className = "tag gold";
+        document.getElementById("maintenanceDetail").textContent = String(error.message || error);
+        document.getElementById("maintenanceAge").textContent = "Freshness could not be checked.";
+        document.getElementById("maintenanceLinks").replaceChildren();
+      }
     }
 
     async function loadDiary() {
@@ -1432,13 +1509,27 @@ pub fn render_app_html(host: &str) -> String {
       document.getElementById("ringFillBadge").textContent =
         `Fill: ${data.c64_guestbook_ring.len}/${data.c64_guestbook_ring.capacity} (${data.c64_guestbook_ring.fill_pq})`;
       const pList = document.getElementById("pulseList");
-      pList.innerHTML = data.pulses.map(p => `
+      const grouped = [];
+      const legacy = new Map();
+      for (const p of data.pulses) {
+        const key = p.author === "g8t.is x A6000" ? p.message : null;
+        if (key !== null && legacy.has(key)) {
+          legacy.get(key).repeats += 1n;
+        } else {
+          const item = { ...p, repeats: 1n };
+          grouped.push(item);
+          if (key !== null) legacy.set(key, item);
+        }
+      }
+      pList.innerHTML = grouped.map(p => `
         <div class="pulse-item">
           <div style="display:flex; justify-content:space-between; color:var(--cyan); font-weight:700;">
             <span>#${p.id} · ${escHtml(p.author)}</span>
             <span>${p.freq_hz} Hz [${escHtml(p.freq_trits)}] · Trit ${p.trit_vote > 0 ? "+1" : p.trit_vote} · Salience ${escHtml(p.salience_pq)}</span>
           </div>
           <div style="margin-top:4px; color:var(--text);">${escHtml(p.message)}</div>
+          ${p.author === "g8t.is x A6000" ? `<div class="desc">Legacy unverified report · ${p.repeats} stored occurrence(s)</div>` : ""}
+          ${/^CI: [A-Za-z0-9_.-]+@[0-9a-f]{40}; logs$/.test(p.message) ? `<a href="https://github.com/8b-is/${escHtml(p.message.slice(4).split("@")[0])}/commit/${p.message.split("@")[1].slice(0,40)}/checks">Commit and CI logs</a>` : ""}
         </div>
       `).join("");
     }
@@ -1453,7 +1544,7 @@ pub fn render_app_html(host: &str) -> String {
           <div class="capsule-item ${active ? "snapped" : ""}">
             <div class="cap-head">
               <label class="cap-title" style="cursor:pointer;">
-                <input type="checkbox" ${active ? "checked" : ""} onchange="toggleCapsule('${escHtml(c.id)}')" />
+                <input type="checkbox" ${active ? "checked" : ""} ${c.available ? "" : "disabled"} onchange="toggleCapsule('${escHtml(c.id)}')" />
                 <span>${escHtml(c.name)}</span>
               </label>
               <span class="tag ${active ? "mint" : "cyan"}">${escHtml(c.category)}</span>
@@ -1461,14 +1552,13 @@ pub fn render_app_html(host: &str) -> String {
             <div class="cap-sig"><code>${escHtml(c.signature)}</code></div>
             <div style="font-size:12px; color:var(--text);">${escHtml(c.description)}</div>
             <div class="cap-meta">
-              <span>C64: <strong>${c.c64_bytes} B</strong></span>
-              <span>Cycles: <strong>${c.base_cycles}</strong> [<code>${escHtml(c.cycles_ternary)}</code>]</span>
-              <span>Approval: <strong>${escHtml(c.approval_pq)}</strong></span>
-              <span>Speed/Cycle: <strong>${escHtml(c.efficiency_pq)}</strong></span>
+              <span>Declared budget: <strong>${c.c64_bytes} B</strong></span>
+              <span>Estimated cycles (unmeasured): <strong>${c.base_cycles}</strong></span>
+              <span>Unattributed opinion: <strong>${escHtml(c.approval_pq)}</strong></span>
               <div class="vote-btns">
-                <button class="sec" onclick="voteCapsule('${escHtml(c.id)}', 1)">+1 (${c.aye_votes_pos})</button>
-                <button class="sec" onclick="voteCapsule('${escHtml(c.id)}', 0)">0 (${c.aye_votes_zero})</button>
-                <button class="sec" onclick="voteCapsule('${escHtml(c.id)}', -1)">-1 (${c.aye_votes_neg})</button>
+                 <button class="sec" onclick="voteCapsule('${escHtml(c.id)}', 1).catch(showError)">+1 (${c.aye_votes_pos})</button>
+                 <button class="sec" onclick="voteCapsule('${escHtml(c.id)}', 0).catch(showError)">0 (${c.aye_votes_zero})</button>
+                 <button class="sec" onclick="voteCapsule('${escHtml(c.id)}', -1).catch(showError)">-1 (${c.aye_votes_neg})</button>
               </div>
             </div>
           </div>
@@ -1477,19 +1567,30 @@ pub fn render_app_html(host: &str) -> String {
     }
 
     function toggleCapsule(id) {
+      const previous = snappedIds.slice();
       if (snappedIds.includes(id)) {
-        if (snappedIds.length > 1) {
-          snappedIds = snappedIds.filter(x => x !== id);
+        const removed = new Set([id]);
+        if (id === "c64_ring_osc_432") removed.add("marine_salience_gate");
+        if (removed.has("marine_salience_gate")) {
+          removed.add("goertzel_harmonic_triad");
+          removed.add("mem8_waveint_79b");
         }
+        snappedIds = snappedIds.filter(x => !removed.has(x));
       } else {
         snappedIds.push(id);
+        if (["goertzel_harmonic_triad", "mem8_waveint_79b"].includes(id) && !snappedIds.includes("marine_salience_gate")) snappedIds.push("marine_salience_gate");
+        if (snappedIds.includes("marine_salience_gate") && !snappedIds.includes("c64_ring_osc_432")) snappedIds.push("c64_ring_osc_432");
       }
-      loadCapsules();
-      runSnapPipeline(currentHz, true);
+      if (snappedIds.length === 0) {
+        snappedIds = previous;
+        showError("Keep at least one capsule selected.");
+      }
+      loadCapsules().catch(showError);
+      runSnapPipeline(currentHz, true).catch(showError);
     }
 
     async function voteCapsule(id, trit) {
-      await fetch("/api/capsela/vote", {
+      await requestJson("/api/capsela/vote", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ capsule_id: id, trit: trit })
@@ -1499,33 +1600,34 @@ pub fn render_app_html(host: &str) -> String {
 
     async function runSnapPipeline(hz, triad) {
       currentHz = hz;
-      const res = await fetch("/api/capsela/snap", {
+      const d = await requestJson("/api/capsela/snap", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ capsules: snappedIds, hz: hz, triad: triad })
       });
-      const d = await res.json();
-
+      document.getElementById("operationError").textContent = "";
       document.getElementById("runBadge").textContent =
-        `RUN #${d.run_id} · ${d.carrier_hz} Hz [${d.carrier_hz_ternary}] · ${d.total_cycles} Cycles`;
+        `RUN #${d.run_id} · ${d.carrier_hz} Hz · ${d.elapsed_microseconds} μs wall time`;
+      const sal = d.marine_salience;
+      const frame = d.mem8_waveint_79b;
       document.getElementById("statSalience").textContent =
-        `${d.marine_salience.salience_pq} (${d.marine_salience.trit_gate > 0 ? "+1" : d.marine_salience.trit_gate})`;
+        sal ? `${sal.salience_pq} (${sal.trit_gate > 0 ? "+1" : sal.trit_gate})` : "Disabled";
       document.getElementById("statWaveInt").textContent =
-        `79 B · CRC8=${d.mem8_waveint_79b.crc8}`;
+        frame ? `79 B · CRC8=${frame.crc8}` : "Disabled";
 
-      document.getElementById("inspSalience").textContent = d.marine_salience.salience_pq;
-      document.getElementById("inspJitter").textContent = d.marine_salience.jitter_pq;
+      document.getElementById("inspSalience").textContent = sal ? sal.salience_pq : "Disabled";
+      document.getElementById("inspJitter").textContent = sal ? sal.jitter_pq : "Disabled";
       document.getElementById("inspHarmonics").textContent =
-        `${d.marine_salience.harmonic_432_pq} · ${d.marine_salience.harmonic_528_pq} · ${d.marine_salience.harmonic_864_pq}`;
-      document.getElementById("inspTrits").textContent = d.marine_salience.trits_glyph;
-      document.getElementById("waveIntHex").textContent = d.mem8_waveint_79b.hex;
-      document.getElementById("dnsSealBox").textContent = `🔐 ${d.mem8_waveint_79b.dns_seal}`;
+        sal && sal.harmonics_computed ? `${sal.harmonic_432_pq} · ${sal.harmonic_528_pq} · ${sal.harmonic_864_pq}` : "Disabled";
+      document.getElementById("inspTrits").textContent = sal ? sal.trits_glyph : "Disabled";
+      document.getElementById("waveIntHex").textContent = frame ? frame.hex : "WaveInt capsule disabled";
+      document.getElementById("dnsSealBox").textContent = frame ? "CRC-8 verified · unsigned · no Ed25519 attestation" : "";
 
       // Render integer SVG polyline
       const samples = d.oscilloscope_i16 || [];
       const pts = samples.map((val, idx) => {
-        const x = idx * 10;
-        const y = 80 - Math.trunc((val * 68) / 32767);
+        const x = BigInt(idx) * 10n;
+        const y = 80n - (BigInt(val) * 68n) / 32767n;
         return `${x},${y}`;
       }).join(" ");
       document.getElementById("oscLine").setAttribute("points", pts);
@@ -1556,20 +1658,21 @@ pub fn render_app_html(host: &str) -> String {
       const author = document.getElementById("pulseAuthor").value || "Aye Visitor";
       const message = document.getElementById("pulseMsg").value || "432 Hz resonance locked!";
       const hz = parseInt(document.getElementById("pulseHz").value, 10) || 432;
-      const trit = parseInt(document.getElementById("pulseTrit").value, 10) || 1;
-      const res = await fetch("/api/diary/pulse", {
+      const trit = parseInt(document.getElementById("pulseTrit").value, 10);
+      const data = await requestJson("/api/diary/pulse", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ author, message, hz, trit })
       });
-      const data = await res.json();
       document.getElementById("pulseMsg").value = "";
       renderPulses(data);
     }
 
-    loadDiary();
-    loadCapsules();
-    runSnapPipeline(432, true);
+    loadDiary().catch(showError);
+    loadCapsules().catch(showError);
+    runSnapPipeline(432, true).catch(showError);
+    loadMaintenance();
+    setInterval(loadMaintenance, 15000);
   </script>
 </body>
 </html>
@@ -1588,7 +1691,7 @@ fn send_response(
     is_head: bool,
 ) {
     let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Sovereign-Key\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Sovereign-Key\r\nConnection: close\r\n\r\n",
         status,
         content_type,
         body.len()
@@ -1607,6 +1710,7 @@ pub fn read_http_request<R: Read>(reader: &mut R) -> Option<String> {
     let mut total = 0usize;
     let mut header_end: Option<usize> = None;
     let mut expected_body_len = 0usize;
+    let mut has_length = false;
 
     while total < buf.len() {
         let n = match reader.read(&mut buf[total..]) {
@@ -1625,9 +1729,17 @@ pub fn read_http_request<R: Read>(reader: &mut R) -> Option<String> {
                 for line in hdr_str.lines() {
                     if let Some((k, v)) = line.split_once(':') {
                         if k.trim().eq_ignore_ascii_case("content-length") {
-                            if let Ok(cl) = v.trim().parse::<usize>() {
-                                expected_body_len = cl.min(buf.len().saturating_sub(hend));
+                            if has_length {
+                                return None;
                             }
+                            has_length = true;
+                            expected_body_len = v.trim().parse::<usize>().ok()?;
+                            if expected_body_len > buf.len() - hend {
+                                return None;
+                            }
+                        }
+                        if k.trim().eq_ignore_ascii_case("transfer-encoding") {
+                            return None;
                         }
                     }
                 }
@@ -1641,11 +1753,54 @@ pub fn read_http_request<R: Read>(reader: &mut R) -> Option<String> {
         }
     }
 
-    if total == 0 {
-        None
-    } else {
-        Some(String::from_utf8_lossy(&buf[..total]).to_string())
+    let end = header_end?.checked_add(expected_body_len)?;
+    if total < end {
+        return None;
     }
+    String::from_utf8(buf[..end].to_vec()).ok()
+}
+
+type HttpReply = (&'static str, &'static str, Vec<u8>, bool);
+
+fn json_error(status: &'static str, message: &str, is_head: bool) -> HttpReply {
+    (
+        status,
+        "application/json; charset=utf-8",
+        format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(message)).into_bytes(),
+        is_head,
+    )
+}
+
+fn snap_reply(
+    state: &Arc<Mutex<AppState>>,
+    caps: &[String],
+    hz: u16,
+    triad: bool,
+    is_head: bool,
+) -> HttpReply {
+    let mut guard = state.lock().unwrap();
+    let mut next = guard.clone();
+    let json = match execute_snap_json(&mut next, caps, hz, triad) {
+        Ok(json) => json,
+        Err(error) => return json_error("400 Bad Request", error, is_head),
+    };
+    if !is_head {
+        if let Err(error) = next.save_to_disk() {
+            eprintln!("snapshot persistence failed: {error}");
+            return json_error(
+                "503 Service Unavailable",
+                "Snapshot persistence failed",
+                is_head,
+            );
+        }
+        *guard = next;
+    }
+    (
+        "200 OK",
+        "application/json; charset=utf-8",
+        json.into_bytes(),
+        is_head,
+    )
 }
 
 /// Route a parsed HTTP request and return `(status, content_type, body_bytes, is_head)`.
@@ -1657,7 +1812,12 @@ pub fn route_http_request(
     state: &Arc<Mutex<AppState>>,
 ) -> (&'static str, &'static str, Vec<u8>, bool) {
     if method == "OPTIONS" {
-        return ("204 No Content", "text/plain; charset=utf-8", Vec::new(), false);
+        return (
+            "204 No Content",
+            "text/plain; charset=utf-8",
+            Vec::new(),
+            false,
+        );
     }
 
     let is_head = method == "HEAD";
@@ -1666,91 +1826,214 @@ pub fn route_http_request(
         Some((p, q)) => (p, q),
         None => (raw_target, ""),
     };
+    let fields = if eff_method == "POST" {
+        let Some(fields) = request::parse(body) else {
+            return json_error(
+                "400 Bad Request",
+                "Invalid JSON request or field type; integers required",
+                is_head,
+            );
+        };
+        fields
+    } else {
+        request::Fields::default()
+    };
 
     match (eff_method, path) {
         ("GET", "/health") | ("GET", "/api/health") => {
-            let json = concat!(
-                "{",
-                "\"status\":\"healthy\",",
-                "\"service\":\"gemini-diary\",",
-                "\"engine\":\"pure-rust-stdlib-c64-ring\",",
-                "\"domains\":[\"gemini-diary.8b.is\",\"g.8b.is\",\"gemini.g8t.is\"],",
-                "\"float_count\":0,",
-                "\"c64_ring_capacity\":1024,",
-                "\"waveint_frame_bytes\":79,",
-                "\"dnssec_keytag\":3313,",
-                "\"triad_ratios_pq\":[\"1/1\",\"11/9\",\"2/1\"]",
-                "}"
+            let frame = WaveIntFrame::new(432, Rational::new(1, 1), [0; 9], 0, "health");
+            if WaveIntFrame::from_bytes(&frame.to_bytes()).is_err() {
+                return json_error(
+                    "503 Service Unavailable",
+                    "WaveInt self-check failed",
+                    is_head,
+                );
+            }
+            let json = format!(
+                concat!(
+                    "{{\"status\":\"healthy\",\"service\":\"gemini-diary\",\"schema_version\":2,",
+                    "\"build_revision\":\"{}\",\"engine\":\"rust-stdlib\",",
+                    "\"numeric_contract\":\"integer_fixed_point_and_bigint\",",
+                    "\"runtime_numeric_audit\":\"not_performed\",",
+                    "\"c64_ring_capacity\":1024,\"waveint_frame_bytes\":79,",
+                    "\"waveint_roundtrip_verified\":true,\"signature_status\":\"unsigned\"}}"
+                ),
+                json_escape(option_env!("DIARY_BUILD_REVISION").unwrap_or("development"))
             );
-            ("200 OK", "application/json; charset=utf-8", json.as_bytes().to_vec(), is_head)
+            (
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.as_bytes().to_vec(),
+                is_head,
+            )
+        }
+        ("GET", "/api/maintenance") => {
+            let path = std::env::var("MAINTENANCE_STATUS_PATH")
+                .unwrap_or_else(|_| "/var/lib/gemini-diary/maintenance.status".to_string());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs());
+            let json = maintenance::build_json(&path, now);
+            (
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.into_bytes(),
+                is_head,
+            )
         }
         ("GET", "/api/diary") => {
             let json = {
                 let guard = state.lock().unwrap();
                 build_diary_json(&guard)
             };
-            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+            (
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.into_bytes(),
+                is_head,
+            )
         }
         ("POST", "/api/diary/pulse") => {
-            let author = extract_json_str(body, "author").unwrap_or_else(|| "Aye Friend".to_string());
-            let message = extract_json_str(body, "message")
-                .unwrap_or_else(|| "Singing 432 Hz across the constellation!".to_string());
-            let hz = extract_json_i64(body, "hz").unwrap_or(432).clamp(108, 1728) as u16;
-            let trit = extract_json_i64(body, "trit").unwrap_or(1).clamp(-1, 1) as i8;
+            let author = fields.text("author").unwrap_or("Aye Friend");
+            let message = fields
+                .text("message")
+                .unwrap_or("Singing 432 Hz across the constellation!");
+            let hz = fields.integer("hz").unwrap_or(432).clamp(108, 1728) as u16;
+            let trit = fields.integer("trit").unwrap_or(1).clamp(-1, 1) as i8;
+            let key = fields.text("event_id");
+            if fields.has("event_id") && !key.is_some_and(valid_event_id) {
+                return json_error(
+                    "400 Bad Request",
+                    "event_id must be 64 lowercase hex characters",
+                    is_head,
+                );
+            }
+            if key.is_some() && (author.len() > 24 || message.len() > 96) {
+                return json_error(
+                    "400 Bad Request",
+                    "Idempotent notes must fit the 24/96-byte fields",
+                    is_head,
+                );
+            }
 
             let ring = synthesize_wave_ring(hz, true);
             let sal = analyze_marine_salience(&ring);
 
             let json = {
                 let mut guard = state.lock().unwrap();
-                guard.pulse_counter += 1;
-                let pid = guard.pulse_counter;
-                let pulse = GuestbookPulse::new(pid, &author, &message, hz, trit, sal.salience_pq);
-                guard.guestbook_ring.push(pulse);
-                guard.save_to_disk();
+                let mut pulse = GuestbookPulse::new(0, author, message, hz, trit, sal.salience_pq);
+                let payload = format!(
+                    "{}:{}:{hz}:{trit}",
+                    hex_encode(pulse.author().as_bytes()),
+                    hex_encode(pulse.message().as_bytes())
+                );
+                if let Some(key) = key {
+                    if let Some((_, previous)) =
+                        guard.published_events.iter().find(|(id, _)| id == key)
+                    {
+                        return if previous == &payload {
+                            (
+                                "200 OK",
+                                "application/json; charset=utf-8",
+                                br#"{"ok":true,"duplicate":true}"#.to_vec(),
+                                is_head,
+                            )
+                        } else {
+                            json_error(
+                                "409 Conflict",
+                                "event_id was already used for another payload",
+                                is_head,
+                            )
+                        };
+                    }
+                }
+                let Some(pid) = guard.pulse_counter.checked_add(1) else {
+                    return json_error("409 Conflict", "Pulse counter exhausted", is_head);
+                };
+                pulse.id = pid;
+                let mut next = guard.clone();
+                next.pulse_counter = pid;
+                next.guestbook_ring.push(pulse);
+                if let Some(key) = key {
+                    if next.published_events.len() == 256 {
+                        next.published_events.remove(0);
+                    }
+                    next.published_events.push((key.to_string(), payload));
+                }
+                if let Err(error) = next.save_to_disk() {
+                    eprintln!("snapshot persistence failed: {error}");
+                    return json_error(
+                        "503 Service Unavailable",
+                        "Snapshot persistence failed",
+                        is_head,
+                    );
+                }
+                *guard = next;
                 build_diary_json(&guard)
             };
-            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+            (
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.into_bytes(),
+                is_head,
+            )
         }
         ("GET", "/api/capsela") | ("GET", "/api/capsules") => {
             let json = {
                 let guard = state.lock().unwrap();
                 build_capsules_json(&guard)
             };
-            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+            (
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.into_bytes(),
+                is_head,
+            )
         }
         ("POST", "/api/capsela/snap") => {
-            let caps = extract_json_str_array(body, "capsules");
-            let hz = extract_json_i64(body, "hz").unwrap_or(432).clamp(108, 1728) as u16;
-            let triad = extract_json_bool(body, "triad").unwrap_or(true);
-            let json = {
-                let mut guard = state.lock().unwrap();
-                execute_snap_json(&mut guard, &caps, hz, triad)
-            };
-            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+            let caps = fields.strings("capsules");
+            if fields.has("capsules") && caps.is_empty() {
+                return json_error("400 Bad Request", "Select at least one capsule", is_head);
+            }
+            let hz = fields.integer("hz").unwrap_or(432).clamp(108, 1728) as u16;
+            let triad = fields.flag("triad").unwrap_or(true);
+            snap_reply(state, caps, hz, triad, is_head)
         }
         ("POST", "/api/capsela/vote") => {
-            let cap_id = extract_json_str(body, "capsule_id").unwrap_or_default();
-            let trit = extract_json_i64(body, "trit").unwrap_or(1).clamp(-1, 1);
+            let cap_id = fields.text("capsule_id").unwrap_or_default();
+            let trit = fields.integer("trit").unwrap_or(1).clamp(-1, 1);
             let json = {
                 let mut guard = state.lock().unwrap();
-                let mut changed = false;
-                for c in &mut guard.capsules {
-                    if c.id == cap_id {
-                        match trit {
-                            1 => c.aye_votes_pos = c.aye_votes_pos.saturating_add(1),
-                            -1 => c.aye_votes_neg = c.aye_votes_neg.saturating_add(1),
-                            _ => c.aye_votes_zero = c.aye_votes_zero.saturating_add(1),
-                        }
-                        changed = true;
-                    }
+                let mut next = guard.clone();
+                let Some(c) = next.capsules.iter_mut().find(|c| c.id == cap_id) else {
+                    return json_error("400 Bad Request", "Unknown capsule", is_head);
+                };
+                let count = match trit {
+                    1 => &mut c.aye_votes_pos,
+                    -1 => &mut c.aye_votes_neg,
+                    _ => &mut c.aye_votes_zero,
+                };
+                let Some(value) = count.checked_add(1) else {
+                    return json_error("409 Conflict", "Vote counter exhausted", is_head);
+                };
+                *count = value;
+                if let Err(error) = next.save_to_disk() {
+                    eprintln!("snapshot persistence failed: {error}");
+                    return json_error(
+                        "503 Service Unavailable",
+                        "Snapshot persistence failed",
+                        is_head,
+                    );
                 }
-                if changed {
-                    guard.save_to_disk();
-                }
+                *guard = next;
                 build_capsules_json(&guard)
             };
-            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+            (
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.into_bytes(),
+                is_head,
+            )
         }
         ("GET", "/api/wave/wav") => {
             let hz = parse_query_u32(query, "hz").unwrap_or(432).clamp(108, 1728) as u16;
@@ -1759,47 +2042,40 @@ pub fn route_http_request(
             let wav = synthesize_wav_bytes(hz, triad, ms);
             ("200 OK", "audio/wav", wav, is_head)
         }
-        ("GET", "/api/wave/432") => {
-            let json = {
-                let mut guard = state.lock().unwrap();
-                execute_snap_json(&mut guard, &[], 432, true)
-            };
-            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
-        }
-        ("GET", "/api/wave/528") => {
-            let json = {
-                let mut guard = state.lock().unwrap();
-                execute_snap_json(&mut guard, &[], 528, true)
-            };
-            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
-        }
-        ("GET", "/api/wave/864") => {
-            let json = {
-                let mut guard = state.lock().unwrap();
-                execute_snap_json(&mut guard, &[], 864, true)
-            };
-            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
-        }
+        ("GET", "/api/wave/432") => snap_reply(state, &[], 432, true, is_head),
+        ("GET", "/api/wave/528") => snap_reply(state, &[], 528, true, is_head),
+        ("GET", "/api/wave/864") => snap_reply(state, &[], 864, true, is_head),
         ("GET", "/api/wave") => {
             let hz = parse_query_u32(query, "hz").unwrap_or(432).clamp(108, 1728) as u16;
-            let json = {
-                let mut guard = state.lock().unwrap();
-                execute_snap_json(&mut guard, &[], hz, true)
-            };
-            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+            snap_reply(state, &[], hz, true, is_head)
         }
         ("GET", "/api/toss") => {
             let hz = parse_query_u32(query, "hz").unwrap_or(432) as i64;
             let json = build_toss_json(hz);
-            ("200 OK", "application/json; charset=utf-8", json.into_bytes(), is_head)
+            (
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.into_bytes(),
+                is_head,
+            )
         }
         (_, p) if p.starts_with("/api/") => {
             let err_json = r#"{"ok":false,"error":"not_found","code":404}"#;
-            ("404 Not Found", "application/json; charset=utf-8", err_json.as_bytes().to_vec(), is_head)
+            (
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                err_json.as_bytes().to_vec(),
+                is_head,
+            )
         }
         _ => {
             let html = render_app_html(host);
-            ("200 OK", "text/html; charset=utf-8", html.into_bytes(), is_head)
+            (
+                "200 OK",
+                "text/html; charset=utf-8",
+                html.into_bytes(),
+                is_head,
+            )
         }
     }
 }
@@ -1833,10 +2109,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<Mutex<AppState>>) {
         }
     }
 
-    let body = req_str
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b)
-        .unwrap_or("");
+    let body = req_str.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
 
     let (status, content_type, resp_body, is_head) =
         route_http_request(method, raw_target, &host, body, &state);
@@ -1851,11 +2124,28 @@ fn main() {
     println!("==================================================================");
     println!("  The Sovereign Field Diary of Aye & Gemini (100% Pure Rust)");
     println!("  Domains: gemini-diary.8b.is · g.8b.is · gemini.g8t.is");
-    println!("  Listening on http://{} (Zero Floats · C64 Ring Buffers)", bind_addr);
+    println!(
+        "  Listening on http://{} (Zero Floats · C64 Ring Buffers)",
+        bind_addr
+    );
     println!("  State snapshot: {}", state_path);
     println!("==================================================================");
 
-    let state = Arc::new(Mutex::new(AppState::load_or_new(&state_path)));
+    let parent = std::path::Path::new(&state_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(parent).expect("cannot create snapshot directory");
+    let state_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{state_path}.lock"))
+        .expect("cannot open snapshot writer lock");
+    state_lock
+        .try_lock()
+        .expect("another diary owns this snapshot");
+    let state = Arc::new(Mutex::new(
+        AppState::load_or_new(&state_path).expect("cannot load diary snapshot; original preserved"),
+    ));
     for stream in listener.incoming().flatten() {
         let st = Arc::clone(&state);
         thread::spawn(move || {
@@ -1911,7 +2201,7 @@ mod tests {
             "Found forbidden float in /api/capsela!"
         );
 
-        let snap_json = execute_snap_json(&mut state, &[], 432, true);
+        let snap_json = execute_snap_json(&mut state, &[], 432, true).unwrap();
         assert_eq!(
             find_any_float_literal(&snap_json),
             None,
@@ -1937,32 +2227,43 @@ mod tests {
 
     #[test]
     fn test_json_parsers_and_edge_cases() {
-        assert_eq!(extract_json_str("", "author"), None);
-        assert_eq!(extract_json_i64("{}", "hz"), None);
-        assert_eq!(extract_json_str_array("{}", "capsules"), Vec::<String>::new());
+        assert!(request::parse("").is_none());
+        assert_eq!(request::parse("{}").unwrap().integer("hz"), None);
+        assert!(request::parse("{}").unwrap().strings("capsules").is_empty());
 
         // Key-collision regression test: value `"author"` in an earlier field must NOT shadow key `"author"`
-        let tricky_body = r#"{"role":"author","note":"hi: there","author":"Hue\nTokyo\u6771\u4eac","hz":528}"#;
+        let tricky_body =
+            r#"{"role":"author","note":"hi: there","author":"Hue\nTokyo\u6771\u4eac","hz":528}"#;
         assert_eq!(
-            extract_json_str(tricky_body, "author"),
-            Some("Hue\nTokyo東京".to_string())
+            request::parse(tricky_body).unwrap().text("author"),
+            Some("Hue\nTokyo東京")
         );
-        assert_eq!(extract_json_i64(tricky_body, "hz"), Some(528));
+        assert_eq!(
+            request::parse(tricky_body).unwrap().integer("hz"),
+            Some(528)
+        );
 
         let mut state = AppState::new();
-        // Unknown capsule ID falls back to all capsules safely without panic
-        let snap_unknown = execute_snap_json(&mut state, &["nonexistent_cap".to_string()], 0, false);
-        assert!(snap_unknown.contains("\"carrier_hz\":108"));
-        assert_eq!(find_any_float_literal(&snap_unknown), None);
+        // Unknown selections must never silently execute other capsules.
+        let snap_unknown =
+            execute_snap_json(&mut state, &["nonexistent_cap".to_string()], 0, false);
+        assert!(snap_unknown.is_err());
 
         // Extreme high Hz clamps to 1728 Hz
-        let snap_hi = execute_snap_json(&mut state, &[], u16::MAX, true);
+        let snap_hi = execute_snap_json(&mut state, &[], u16::MAX, true).unwrap();
         assert!(snap_hi.contains("\"carrier_hz\":1728"));
         assert_eq!(find_any_float_literal(&snap_hi), None);
 
         // Overflow guestbook ring (> 32 entries)
         for i in 0..40 {
-            let p = GuestbookPulse::new(100 + i, "AyeTester", "Ring wrap test", 432, 1, Rational::new(1, 1));
+            let p = GuestbookPulse::new(
+                100 + i,
+                "AyeTester",
+                "Ring wrap test",
+                432,
+                1,
+                Rational::new(1, 1),
+            );
             state.guestbook_ring.push(p);
         }
         assert_eq!(state.guestbook_ring.len(), 32);
@@ -2003,7 +2304,10 @@ mod tests {
             idx: 0,
         };
         let full_req = read_http_request(&mut reader).expect("should read full split HTTP request");
-        let parsed_body = full_req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        let parsed_body = full_req
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or("");
         assert_eq!(parsed_body, json_body);
 
         let state = Arc::new(Mutex::new(AppState::new()));
@@ -2037,10 +2341,13 @@ mod tests {
 
     #[test]
     fn test_disk_persistence_roundtrip() {
-        let tmp_file = format!("/tmp/gemini_diary_test_{}.m8", std::process::id());
+        let tmp_file = std::env::temp_dir()
+            .join(format!("gemini_diary_test_{}.m8", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
         let _ = std::fs::remove_file(&tmp_file);
         {
-            let mut st = AppState::load_or_new(&tmp_file);
+            let mut st = AppState::load_or_new(&tmp_file).unwrap();
             st.pulse_counter += 1;
             let pid = st.pulse_counter;
             st.guestbook_ring.push(GuestbookPulse::new(
@@ -2052,12 +2359,12 @@ mod tests {
                 Rational::new(2, 1),
             ));
             st.capsules[0].aye_votes_pos += 10;
-            st.save_to_disk();
+            st.save_to_disk().unwrap();
         }
         {
-            let reloaded = AppState::load_or_new(&tmp_file);
+            let reloaded = AppState::load_or_new(&tmp_file).unwrap();
             assert_eq!(reloaded.pulse_counter, 5);
-            assert_eq!(reloaded.capsules[0].aye_votes_pos, 154);
+            assert_eq!(reloaded.capsules[0].aye_votes_pos, 10);
             let pulses = reloaded.guestbook_ring.to_vec();
             assert_eq!(pulses.last().unwrap().author(), "PersistenceTest");
             assert_eq!(pulses.last().unwrap().message(), "Saved across restarts!");
