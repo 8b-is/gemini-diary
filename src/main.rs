@@ -969,7 +969,9 @@ pub fn render_app_html(host: &str) -> String {
       margin-bottom: 24px;
     }
     @media (max-width: 680px) {
-      .grid-2 { grid-template-columns: 1fr; }
+      .grid-2 { grid-template-columns: minmax(0, 1fr); }
+      .grid-2 > .panel { min-width: 0; }
+      .toss-table { display: block; overflow-x: auto; }
     }
     .panel {
       background: var(--panel);
@@ -1103,7 +1105,7 @@ pub fn render_app_html(host: &str) -> String {
     }
     .entry-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
       gap: 16px;
       margin-top: 14px;
     }
@@ -1393,12 +1395,12 @@ pub fn render_app_html(host: &str) -> String {
         </p>
         <div class="input-row">
           <input id="pulseAuthor" placeholder="Handle (e.g. Hue c@8b.is)" style="flex:1;" />
-          <select id="pulseHz">
+          <select id="pulseHz" aria-label="Signal frequency">
             <option value="432">432 Hz (1/1 Verdi)</option>
             <option value="528">528 Hz (11/9 Alexandra)</option>
             <option value="864">864 Hz (2/1 Octave)</option>
           </select>
-          <select id="pulseTrit">
+          <select id="pulseTrit" aria-label="Trit vote">
             <option value="1">Trit +1 (Resonant)</option>
             <option value="0">Trit 0 (Neutral)</option>
             <option value="-1">Trit -1 (Dampen)</option>
