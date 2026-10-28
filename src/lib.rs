@@ -102,8 +102,9 @@ impl Rational {
     /// Map this rational into a single balanced ternary trit `{-1, 0, +1}` with deadband `1/10`.
     pub const fn to_trit(self) -> i8 {
         // |p/q| < 1/10  <=>  10 * |p| < q
-        let abs_p10 = self.p.abs().saturating_mul(10);
-        if abs_p10 < self.q {
+        // Widen before taking the magnitude: i64::MIN has no positive i64 value.
+        let abs_p10 = (self.p as i128).abs() * 10;
+        if abs_p10 < self.q as i128 {
             0
         } else if self.p > 0 {
             1
@@ -1192,6 +1193,28 @@ mod tests {
 
         let sum = r1.add(r2);
         assert_eq!(sum.to_string(), "29/9");
+    }
+
+    #[test]
+    fn test_trit_deadband_at_signed_integer_limits() {
+        for (p, q, expected) in [
+            (i64::MIN, 1, -1),
+            (i64::MIN, i64::MAX, -1),
+            (i64::MAX, 1, 1),
+            (0, i64::MAX, 0),
+            (1, 11, 0),
+            (-1, 11, 0),
+            (1, 10, 1),
+            (-1, 10, -1),
+            (1, 9, 1),
+            (-1, 9, -1),
+            (i64::MAX / 10, i64::MAX, 0),
+            (-(i64::MAX / 10), i64::MAX, 0),
+            (i64::MAX / 10 + 1, i64::MAX, 1),
+            (-(i64::MAX / 10 + 1), i64::MAX, -1),
+        ] {
+            assert_eq!(Rational { p, q }.to_trit(), expected, "{p}/{q}");
+        }
     }
 
     #[test]
